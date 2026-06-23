@@ -1,0 +1,46 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+model:
+  size: "medium"          # nano | small | medium | large | base
+  checkpoint: "models/rf-detr-medium.pth"          # 自定义权重路径，留空则使用 COCO 预训练
+  confidence: 0.5
+  resolution: 576         # 推理分辨率，可在速度与精度间权衡
+  optimize_inference: true
+  device: "cuda"          # auto | cuda | cpu
+  class_names: ["Fire", "Smoke","Human","Vehicle","Animal","Other"]         # 自定义类别名，留空则使用 COCO 80 类
+
+video:
+  source: "0"             # RTSP URL、HTTP 流或摄像头索引
+  fps_limit: 15
+  skip_frames: 0          # 跳帧数以降低负载
+  reconnect_delay: 3
+
+training:
+  dataset_dir: ""
+  output_dir: "outputs/train"
+  epochs: 50
+  batch_size: 4
+  grad_accum_steps: 4
+  lr: 0.0001
+  resume: false
+  gpu_ids: [0]
+
+inference_instances:
+  - id: default
+    name: 默认推理实例
+    size: medium
+    checkpoint: ""
+    gpu_ids: [0]
+    confidence: 0.5
+    resolution: 576
+    optimize_inference: true
+    class_names: []
+
+default_instance_id: default
+
+paths:
+  uploads: "data/uploads"
+  results: "data/results"
+  logs: "data/logs"

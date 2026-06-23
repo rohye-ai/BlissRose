@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>登录 - 智能视觉分析系统</title>
+  <link rel="stylesheet" href="/assets/css/style.css?v=12" />
+  <link rel="stylesheet" href="/assets/css/theme-gov.css?v=12" />
+</head>
+<body class="login-page">
+  <div class="login-container">
+    <div class="login-card">
+      <div class="login-brand">
+        <div class="logo" id="loginLogo"></div>
+        <h1>智能视觉分析系统</h1>
+      </div>
+      <form id="loginForm" class="login-form">
+        <div class="form-field">
+          <label for="username">用户名</label>
+          <input type="text" id="username" name="username" placeholder="admin" autocomplete="username" required />
+        </div>
+        <div class="form-field">
+          <label for="password">密码</label>
+          <input type="password" id="password" name="password" placeholder="请输入密码" autocomplete="current-password" required />
+        </div>
+        <button type="submit" class="btn btn-primary btn-block" id="btnLogin">登 录</button>
+        <p class="login-hint">内置管理员账号：admin / admin123</p>
+        <p class="login-error" id="loginError"></p>
+      </form>
+    </div>
+  </div>
+  <script src="/assets/js/icons.js?v=12"></script>
+  <script src="/assets/js/login.js?v=12"></script>
+</body>
+</html>

@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>智能视觉分析系统</title>
+  <link rel="stylesheet" href="/assets/css/style.css?v=21" />
+  <link rel="stylesheet" href="/assets/css/theme-gov.css?v=17" />
+</head>
+<body>
+  <div class="app-layout">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-brand">
+        <div class="logo" id="brandLogo"></div>
+        <strong class="brand-name">智能视觉分析系统</strong>
+      </div>
+      <nav class="sidebar-nav" id="sidebarNav"></nav>
+    </aside>
+
+    <div class="main-area">
+      <div class="top-bar">
+        <div class="user-dropdown" id="userDropdown">
+          <button type="button" class="user-dropdown-trigger" id="userDropdownTrigger" aria-haspopup="true" aria-expanded="false">
+            <span class="user-avatar" id="userAvatar">A</span>
+            <span class="user-dropdown-name" id="topBarUserName">-</span>
+            <svg class="dropdown-chevron" viewBox="0 0 1024 1024" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M512 714.7L170.7 373.3h682.6L512 714.7z"/></svg>
+          </button>
+          <div class="user-dropdown-menu" id="userDropdownMenu" hidden>
+            <div class="user-dropdown-meta">
+              <strong id="dropdownUserName">-</strong>
+              <span id="dropdownUserRoles">-</span>
+            </div>
+            <button type="button" class="user-dropdown-item" id="btnLogout">退出登录</button>
+          </div>
+        </div>
+      </div>
+      <div class="page-tabs">
+        <div class="page-tab active" id="activePageTab">
+          <span id="activePageTabIcon"></span>
+          <span id="activePageTabLabel">总览</span>
+        </div>
+      </div>
+
+      <header class="header">
+        <div class="header-title">
+          <h1 id="pageTitle">总览</h1>
+          <p id="pageSubtitle">GPU 监控 · 多实例推理 · 单卡/多卡训练</p>
+        </div>
+        <div class="header-status" id="headerStatus">
+          <span class="badge badge-stopped" id="gpuBadge">GPU: -</span>
+          <span class="badge badge-stopped" id="modelBadge">实例: 0 运行</span>
+          <span class="badge badge-stopped" id="videoBadge">视频: 停止</span>
+          <span class="badge badge-stopped" id="trainBadge">训练: 空闲</span>
+        </div>
+      </header>
+
+      <main class="content">
+        <!-- Dashboard -->
+        <section class="panel active" id="panel-dashboard">
+          <div class="card">
+            <div class="btn-row" style="justify-content: space-between; align-items: center;">
+              <h2 style="margin:0">GPU 资源监控</h2>
+              <button class="btn btn-secondary btn-sm" id="btnRefreshDashboardGpu">刷新</button>
+            </div>
+            <p class="hint">实时显示显卡数量、显存占用、计算利用率与温度（需 nvidia-smi）。</p>
+            <div id="dashboardGpuGrid" class="gpu-grid"></div>
+          </div>
+          <div class="card">
+            <h2>推理实例快照</h2>
+            <div id="dashboardInstanceList" class="instance-list"></div>
+          </div>
+          <div class="card">
+            <h2>最近检测结果</h2>
+            <div class="preview-row">
+              <div class="preview-frame is-empty" data-preview-for="dashboardPreview">
+                <div class="preview-empty">暂无图片</div>
+                <img id="dashboardPreview" alt="" hidden />
+                <span class="preview-hint">点击查看大图</span>
+              </div>
+              <div id="dashboardDetections" class="det-list"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Models -->
+        <section class="panel" id="panel-models">
+          <div class="card table-card">
+            <div class="table-toolbar">
+              <div class="toolbar-left">
+                <h2>模型管理</h2>
+                <span class="table-count" id="modelTableCount">共 0 条</span>
+              </div>
+              <div class="toolbar-right">
+                <input type="text" class="search-input" id="modelSearch" placeholder="搜索名称 / 类型..." />
+                <button class="btn btn-primary btn-sm" id="btnUploadModel"><span class="btn-add-icon"></span> 上传模型</button>
+              </div>
+            </div>
+            <p class="hint">支持 YOLO 与 RF-DETR 类型。上传后可在推理实例与训练任务中选择，已被引用的模型不可删除。</p>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead><tr><th>名称</th><th>类型</th><th>权重</th><th>版本</th><th>来源</th><th>上传时间</th><th>上传人员</th><th>状态</th><th class="col-actions">操作</th></tr></thead>
+                <tbody id="modelTableBody"></tbody>
+              </table>
+              <div class="table-empty" id="modelTableEmpty" hidden>暂无模型，请上传</div>
+            </div>
+            <div class="table-pagination" id="modelPagination"></div>
+          </div>
+        </section>
+
+        <!-- Datasets -->
+        <section class="panel" id="panel-datasets">
+          <div class="card table-card">
+            <div class="table-toolbar">
+              <div class="toolbar-left">
+                <h2>数据集管理</h2>
+                <span class="table-count" id="datasetTableCount">共 0 条</span>
+              </div>
+              <div class="toolbar-right">
+                <input type="text" class="search-input" id="datasetSearch" placeholder="搜索名称..." />
+                <button class="btn btn-primary btn-sm" id="btnUploadDataset"><span class="btn-add-icon"></span> 上传 ZIP</button>
+              </div>
+            </div>
+            <p class="hint">ZIP 需包含 train、valid、test 目录及 data.yaml（YOLO 格式）。</p>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead><tr><th>名称</th><th>ID</th><th>Train</th><th>Valid</th><th>Test</th><th>上传时间</th><th>上传人员</th><th>类别</th><th class="col-actions">操作</th></tr></thead>
+                <tbody id="datasetTableBody"></tbody>
+              </table>
+              <div class="table-empty" id="datasetTableEmpty" hidden>暂无数据集</div>
+            </div>
+            <div class="table-pagination" id="datasetPagination"></div>
+          </div>
+        </section>
+
+        <!-- Devices -->
+        <section class="panel" id="panel-devices">
+          <div class="card table-card">
+            <div class="table-toolbar">
+              <div class="toolbar-left">
+                <h2>设备管理</h2>
+                <span class="table-count" id="deviceTableCount">共 0 条</span>
+              </div>
+              <div class="toolbar-right">
+                <input type="text" class="search-input" id="deviceSearch" placeholder="搜索名称 / 地址 / 创建人..." />
+                <select class="filter-select" id="deviceFilterCreator"><option value="">全部创建人</option></select>
+                <input type="date" class="filter-date" id="deviceCreatedFrom" title="创建起始日期" aria-label="创建起始日期" />
+                <input type="date" class="filter-date" id="deviceCreatedTo" title="创建截止日期" aria-label="创建截止日期" />
+                <button class="btn btn-primary btn-sm" id="btnAddDevice"><span class="btn-add-icon"></span> 新建设备</button>
+              </div>
+            </div>
+            <p class="hint">视频流设备实时拉流分析；图片流设备按间隔定时获取图片分析。添加设备后点击「配置 ROI」在画面上绘制检测区域。</p>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead><tr><th>名称</th><th>类型</th><th>源地址</th><th>轮询</th><th>ROI</th><th>状态</th><th>创建时间</th><th>修改时间</th><th>创建人</th><th>修改人</th><th class="col-actions">操作</th></tr></thead>
+                <tbody id="deviceTableBody"></tbody>
+              </table>
+              <div class="table-empty" id="deviceTableEmpty" hidden>暂无设备</div>
+            </div>
+            <div class="table-pagination" id="devicePagination"></div>
+          </div>
+        </section>
+
+        <!-- Inference Instances -->
+        <section class="panel" id="panel-gpu">
+          <div class="card table-card">
+            <div class="table-toolbar">
+              <div class="toolbar-left">
+                <h2>推理实例管理</h2>
+                <span class="table-count" id="instanceTableCount">共 0 条</span>
+              </div>
+              <div class="toolbar-right">
+                <input type="text" class="search-input" id="instanceSearch" placeholder="搜索名称 / 模型 / 创建人..." />
+                <select class="filter-select" id="instanceFilterState">
+                  <option value="">全部状态</option>
+                  <option value="ready">运行中</option>
+                  <option value="stopped">已停止</option>
+                  <option value="loading">加载中</option>
+                  <option value="error">异常</option>
+                </select>
+                <select class="filter-select" id="instanceFilterCreator"><option value="">全部创建人</option></select>
+                <input type="date" class="filter-date" id="instanceCreatedFrom" title="创建起始日期" aria-label="创建起始日期" />
+                <input type="date" class="filter-date" id="instanceCreatedTo" title="创建截止日期" aria-label="创建截止日期" />
+                <button class="btn btn-primary btn-sm" id="btnAddInstance"><span class="btn-add-icon"></span> 新建实例</button>
+              </div>
+            </div>
+            <p class="hint">每个实例须绑定已上传模型，可配置 GPU、设备并轮询分析。</p>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>实例名称</th>
+                    <th>ID</th>
+                    <th>状态</th>
+                    <th>GPU</th>
+                    <th>模型</th>
+                    <th>设备</th>
+                    <th>置信度</th>
+                    <th>最近推理</th>
+                    <th>创建时间</th>
+                    <th>修改时间</th>
+                    <th>创建人</th>
+                    <th>修改人</th>
+                    <th class="col-actions">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="instanceTableBody"></tbody>
+              </table>
+              <div class="table-empty" id="instanceTableEmpty" hidden>暂无匹配的推理实例</div>
+            </div>
+            <div class="table-pagination" id="instancePagination"></div>
+          </div>
+        </section>
+
+        <!-- Alerts -->
+        <section class="panel" id="panel-alerts">
+          <div class="card">
+            <div class="table-toolbar">
+              <div class="toolbar-left"><h2>报警记录</h2></div>
+              <div class="toolbar-right">
+                <select class="filter-select" id="alertDeviceFilter"><option value="">全部设备</option></select>
+                <button class="btn btn-secondary btn-sm" id="btnRefreshAlerts">刷新</button>
+              </div>
+            </div>
+            <p class="hint">当设备分析检测到置信度达到实例阈值的目标时，自动保存标注图片并记录报警。</p>
+            <div id="alertGrid" class="alert-grid"></div>
+            <div class="table-pagination" id="alertPagination"></div>
+          </div>
+        </section>
+
+        <!-- Inference -->
+        <section class="panel" id="panel-infer">
+          <div class="grid-2">
+            <div class="card">
+              <h2>上传图片推理</h2>
+              <label>选择推理实例</label>
+              <select id="inferInstanceSelect"></select>
+              <div class="upload-zone" id="uploadZone">
+                <input type="file" id="fileInput" accept="image/*" hidden />
+                <p>拖拽图片到此处，或点击选择</p>
+              </div>
+              <button class="btn btn-primary" id="btnInferUpload">开始推理</button>
+            </div>
+            <div class="card">
+              <h2>图片 URL 推理</h2>
+              <label>选择推理实例</label>
+              <select id="inferUrlInstanceSelect"></select>
+              <label>图片地址</label>
+              <input type="url" id="urlInput" placeholder="https://example.com/image.jpg" />
+              <button class="btn btn-primary" id="btnInferUrl">URL 推理</button>
+            </div>
+          </div>
+          <div class="card">
+            <h2>推理结果</h2>
+            <div class="preview-row">
+              <div class="preview-frame is-empty" data-preview-for="inferPreview">
+                <div class="preview-empty">暂无图片</div>
+                <img id="inferPreview" alt="" hidden />
+                <span class="preview-hint">点击查看大图</span>
+              </div>
+              <div>
+                <p id="inferMeta"></p>
+                <div id="inferDetections" class="det-list"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Video -->
+        <section class="panel" id="panel-video">
+          <div class="grid-2">
+            <div class="card">
+              <h2>视频流控制</h2>
+              <label>绑定推理实例</label>
+              <select id="videoInstanceSelect"></select>
+              <label>视频源（RTSP / HTTP / 摄像头索引）</label>
+              <input type="text" id="videoSourceInput" placeholder="rtsp://... 或 0" />
+              <div class="inline-fields">
+                <div>
+                  <label>FPS 限制</label>
+                  <input type="number" id="videoFpsInput" min="1" max="60" />
+                </div>
+                <div>
+                  <label>跳帧</label>
+                  <input type="number" id="videoSkipInput" min="0" max="30" />
+                </div>
+              </div>
+              <div class="btn-row">
+                <button class="btn btn-primary" id="btnSaveVideoCfg">保存配置</button>
+                <button class="btn btn-primary" id="btnStartVideo">启动视频流</button>
+                <button class="btn btn-danger" id="btnStopVideo">停止视频流</button>
+              </div>
+              <p class="hint" id="videoMessage">视频流未启动</p>
+            </div>
+            <div class="card">
+              <h2>实时检测画面</h2>
+              <div class="video-wrap">
+                <img id="mjpegStream" alt="视频流" />
+              </div>
+              <p id="videoStats">FPS: - | 检测数: -</p>
+            </div>
+          </div>
+          <div class="card">
+            <h2>当前帧检测明细</h2>
+            <div id="videoDetections" class="det-list"></div>
+          </div>
+        </section>
+
+        <!-- Training -->
+        <section class="panel" id="panel-train">
+          <div class="card table-card">
+            <div class="table-toolbar">
+              <div class="toolbar-left"><h2>训练任务列表</h2><span class="table-count" id="trainJobTableCount">共 0 条</span></div>
+              <div class="toolbar-right">
+                <input type="text" class="search-input" id="trainJobSearch" placeholder="搜索任务 / 模型 / 创建人..." />
+                <select class="filter-select" id="trainJobFilterState">
+                  <option value="">全部状态</option>
+                  <option value="pending">待训练</option>
+                  <option value="running">训练中</option>
+                  <option value="completed">已完成</option>
+                  <option value="failed">失败</option>
+                </select>
+                <select class="filter-select" id="trainJobFilterCreator"><option value="">全部创建人</option></select>
+                <input type="date" class="filter-date" id="trainJobCreatedFrom" title="创建起始日期" aria-label="创建起始日期" />
+                <input type="date" class="filter-date" id="trainJobCreatedTo" title="创建截止日期" aria-label="创建截止日期" />
+                <button class="btn btn-primary btn-sm" id="btnAddTrainJob"><span class="btn-add-icon"></span> 新建任务</button>
+              </div>
+            </div>
+            <p class="hint">训练完成后点击「部署」将权重自动加入模型列表。运行中的任务可单独停止并查看日志。</p>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead><tr><th>名称</th><th>基础模型</th><th>数据集</th><th>状态</th><th>Epochs</th><th>消息</th><th>创建时间</th><th>修改时间</th><th>创建人</th><th>修改人</th><th class="col-actions">操作</th></tr></thead>
+                <tbody id="trainJobTableBody"></tbody>
+              </table>
+              <div class="table-empty" id="trainJobTableEmpty" hidden>暂无训练任务</div>
+            </div>
+            <div class="table-pagination" id="trainJobPagination"></div>
+          </div>
+        </section>
+
+        <!-- Settings -->
+        <section class="panel" id="panel-settings">
+          <div class="card">
+            <h2>全局默认参数</h2>
+            <p class="hint">配置保存在 SQLite 数据库中。新建推理实例时会继承这些默认值。</p>
+            <div class="form-grid">
+              <div>
+                <label>默认置信度</label>
+                <input type="number" id="cfgConfidence" min="0.01" max="0.99" step="0.01" />
+              </div>
+              <div>
+                <label>默认推理分辨率</label>
+                <input type="number" id="cfgResolution" min="320" max="880" step="32" />
+              </div>
+              <div class="full">
+                <label>默认类别名（逗号分隔）</label>
+                <input type="text" id="cfgClassNames" placeholder="Fire,Smoke" />
+              </div>
+              <div>
+                <label>
+                  <input type="checkbox" id="cfgOptimize" /> 默认开启推理优化
+                </label>
+              </div>
+              <div>
+                <label>默认推理实例 ID</label>
+                <input type="text" id="cfgDefaultInstanceId" placeholder="default" />
+              </div>
+            </div>
+            <button class="btn btn-primary" id="btnSaveModelCfg">保存全局默认</button>
+          </div>
+        </section>
+
+        <!-- API -->
+        <section class="panel" id="panel-api">
+          <div class="card">
+            <h2>REST API 接口</h2>
+            <p class="hint">除登录接口外，所有 API 需在 Header 中携带 <code>Authorization: Bearer &lt;token&gt;</code></p>
+            <table class="api-table">
+              <thead>
+                <tr><th>方法</th><th>路径</th><th>说明</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>POST</td><td>/api/auth/login</td><td>登录获取 Token</td></tr>
+                <tr><td>GET</td><td>/api/auth/me</td><td>当前用户与菜单权限</td></tr>
+                <tr><td>GET</td><td>/api/gpu</td><td>GPU 数量与资源使用</td></tr>
+                <tr><td>GET</td><td>/api/instances</td><td>推理实例列表</td></tr>
+                <tr><td>POST</td><td>/api/infer/image</td><td>上传推理</td></tr>
+                <tr><td>PUT</td><td>/api/config</td><td>更新配置（SQLite）</td></tr>
+                <tr><td>WS</td><td>/ws/events?token=</td><td>实时事件推送</td></tr>
+              </tbody>
+            </table>
+            <p>Swagger 文档: <a href="/docs" target="_blank">/docs</a></p>
+          </div>
+        </section>
+
+        <!-- Users -->
+        <section class="panel" id="panel-users">
+          <div class="card table-card">
+            <div class="table-toolbar">
+              <div class="toolbar-left">
+                <h2>用户管理</h2>
+                <span class="table-count" id="userTableCount">共 0 条</span>
+              </div>
+              <div class="toolbar-right">
+                <input type="text" class="search-input" id="userSearch" placeholder="搜索用户名 / 显示名 / 创建人..." />
+                <select class="filter-select" id="userFilterStatus">
+                  <option value="">全部状态</option>
+                  <option value="active">启用</option>
+                  <option value="inactive">禁用</option>
+                </select>
+                <select class="filter-select" id="userFilterRole">
+                  <option value="">全部角色</option>
+                </select>
+                <select class="filter-select" id="userFilterCreator"><option value="">全部创建人</option></select>
+                <input type="date" class="filter-date" id="userCreatedFrom" title="创建起始日期" aria-label="创建起始日期" />
+                <input type="date" class="filter-date" id="userCreatedTo" title="创建截止日期" aria-label="创建截止日期" />
+                <button class="btn btn-primary btn-sm" id="btnAddUser"><span class="btn-add-icon"></span> 新建用户</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>用户名</th>
+                    <th>显示名称</th>
+                    <th>角色</th>
+                    <th>状态</th>
+                    <th>创建时间</th>
+                    <th>修改时间</th>
+                    <th>创建人</th>
+                    <th>修改人</th>
+                    <th class="col-actions">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="userTableBody"></tbody>
+              </table>
+              <div class="table-empty" id="userTableEmpty" hidden>暂无匹配的用户</div>
+            </div>
+            <div class="table-pagination" id="userPagination"></div>
+          </div>
+        </section>
+
+        <!-- Roles -->
+        <section class="panel" id="panel-roles">
+          <div class="card table-card">
+            <div class="table-toolbar">
+              <div class="toolbar-left">
+                <h2>角色管理</h2>
+                <span class="table-count" id="roleTableCount">共 0 条</span>
+              </div>
+              <div class="toolbar-right">
+                <input type="text" class="search-input" id="roleSearch" placeholder="搜索角色名 / 描述 / 创建人..." />
+                <select class="filter-select" id="roleFilterCreator"><option value="">全部创建人</option></select>
+                <input type="date" class="filter-date" id="roleCreatedFrom" title="创建起始日期" aria-label="创建起始日期" />
+                <input type="date" class="filter-date" id="roleCreatedTo" title="创建截止日期" aria-label="创建截止日期" />
+                <button class="btn btn-primary btn-sm" id="btnAddRole"><span class="btn-add-icon"></span> 新建角色</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>角色名称</th>
+                    <th>描述</th>
+                    <th>菜单权限</th>
+                    <th>创建时间</th>
+                    <th>修改时间</th>
+                    <th>创建人</th>
+                    <th>修改人</th>
+                    <th class="col-actions">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="roleTableBody"></tbody>
+              </table>
+              <div class="table-empty" id="roleTableEmpty" hidden>暂无匹配的角色</div>
+            </div>
+            <div class="table-pagination" id="rolePagination"></div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <div class="lightbox" id="lightbox">
+    <button class="lightbox-close" id="lightboxClose" type="button" aria-label="关闭">&times;</button>
+    <img id="lightboxImg" alt="大图预览" />
+  </div>
+
+  <div class="dataset-viewer" id="datasetViewer" hidden>
+    <div class="dataset-viewer-header">
+      <div class="dataset-viewer-title">
+        <strong id="dvDatasetName">数据集</strong>
+        <span id="dvMeta" class="hint"></span>
+      </div>
+      <div class="dataset-viewer-tools">
+        <select id="dvSplitSelect" class="filter-select">
+          <option value="train">train</option>
+          <option value="valid">valid</option>
+          <option value="test">test</option>
+        </select>
+        <label class="dv-toggle-label" id="dvLabelToggleWrap" hidden>
+          <input type="checkbox" id="dvShowLabels" checked /> 展示标注信息
+        </label>
+        <button type="button" class="btn btn-secondary btn-sm" id="dvClose">关闭</button>
+      </div>
+    </div>
+    <div class="dataset-viewer-body">
+      <button type="button" class="dv-nav dv-prev" id="dvPrev" aria-label="上一张">&#10094;</button>
+      <div class="dv-stage">
+        <div class="dv-image-wrap">
+          <img id="dvImage" alt="数据集图片" />
+          <canvas id="dvCanvas"></canvas>
+        </div>
+        <p id="dvImageName" class="dv-image-name"></p>
+        <p id="dvNavHint" class="hint">← → 切换图片 · Esc 关闭</p>
+      </div>
+      <button type="button" class="dv-nav dv-next" id="dvNext" aria-label="下一张">&#10095;</button>
+    </div>
+    <div class="dataset-viewer-labels" id="dvLabelPanel" hidden>
+      <h4>标注明细</h4>
+      <div id="dvLabelList" class="det-list"></div>
+    </div>
+  </div>
+
+  <div class="dataset-viewer roi-viewer" id="roiViewer" hidden>
+    <div class="dataset-viewer-header">
+      <div class="dataset-viewer-title">
+        <strong id="roiDeviceName">ROI 配置</strong>
+        <span id="roiStatus" class="hint">加载中...</span>
+      </div>
+      <div class="dataset-viewer-tools">
+        <button type="button" class="btn btn-secondary btn-sm" id="roiRefreshPreview">刷新画面</button>
+        <button type="button" class="btn btn-secondary btn-sm" id="roiClearAll">清除全部</button>
+        <button type="button" class="btn btn-primary btn-sm" id="roiSave">保存 ROI</button>
+        <button type="button" class="btn btn-secondary btn-sm" id="roiClose">关闭</button>
+      </div>
+    </div>
+    <div class="roi-viewer-body">
+      <div class="roi-stage">
+        <div class="roi-image-wrap" id="roiImageWrap">
+          <img id="roiImage" alt="设备画面预览" />
+          <canvas id="roiCanvas"></canvas>
+        </div>
+        <p class="dv-image-name">在画面上拖拽绘制矩形区域 · 留空表示全图检测</p>
+      </div>
+      <aside class="roi-side-panel">
+        <h4>已配置区域 <span id="roiCount" class="tag">0</span></h4>
+        <p class="hint">坐标为相对图片宽高的比例 (0~1)。检测目标中心点落在区域内才触发报警。</p>
+        <div id="roiList" class="roi-list"></div>
+      </aside>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="modalBackdrop">
+    <div class="modal" id="modal">
+      <div class="modal-header">
+        <h3 id="modalTitle">标题</h3>
+        <button class="modal-close" id="modalClose" type="button" aria-label="关闭">&times;</button>
+      </div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="modalCancel" type="button">取消</button>
+        <button class="btn btn-primary" id="modalConfirm" type="button">保存</button>
+      </div>
+    </div>
+  </div>
+  <script src="/assets/js/icons.js?v=21"></script>
+  <script src="/assets/js/app.js?v=22"></script>
+  <script src="/assets/js/app-platform.js?v=22"></script>
+</body>
+</html>

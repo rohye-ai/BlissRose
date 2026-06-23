@@ -1,0 +1,6 @@
+{
+  "python.defaultInterpreterPath": "C:\\Users\\stone\\.conda\\envs\\rf-detr\\python.exe",
+  "python.condaPath": "C:\\ProgramData\\anaconda3\\Scripts\\conda.exe",
+  "python.languageServer": "None",
+  "python.terminal.activateEnvironment": true
+}
