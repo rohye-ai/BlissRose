@@ -42,7 +42,14 @@ from .rbac_routes import admin_router, router as auth_router
 from .schemas import AppConfig, InferUrlRequest, InferenceInstanceConfig, StatusResponse
 from .seed import init_database
 from .platform_routes import router as platform_router
-from .platform_service import apply_model_to_instance_config, ensure_platform_dirs
+from .ml_routes import router as ml_router
+from .instance_service import (
+    create_inference_instance,
+    delete_inference_instance,
+    get_inference_instance,
+    update_inference_instance,
+)
+from .platform_service import ensure_platform_dirs
 from .analysis_worker import analysis_worker
 from .training_worker import training_worker
 
@@ -85,6 +92,7 @@ async def auth_middleware(request, call_next):
 app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(platform_router)
+app.include_router(ml_router)
 
 
 
@@ -104,36 +112,7 @@ if FRONTEND_DIR.exists():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIR)), name="assets")
 
 
-
-_ws_clients: set[WebSocket] = set()
-
-
-
-
-
-async def broadcast(event: str, data: dict[str, Any]) -> None:
-
-    message = json.dumps({"event": event, "data": data}, ensure_ascii=False)
-
-    dead: list[WebSocket] = []
-
-    for ws in list(_ws_clients):
-
-        try:
-
-            await ws.send_text(message)
-
-        except Exception:
-
-            dead.append(ws)
-
-    for ws in dead:
-
-        _ws_clients.discard(ws)
-
-
-
-
+from .events import broadcast, register_ws, unregister_ws
 
 def _status() -> StatusResponse:
 
@@ -315,65 +294,17 @@ async def create_instance(request: Request, body: dict[str, Any] | None = None) 
 
     db = SessionLocal()
     try:
-        body = apply_model_to_instance_config(dict(body), db)
+        new_cfg = create_inference_instance(db, body, username)
     finally:
         db.close()
 
-    if not body.get("model_id"):
-        raise HTTPException(status_code=400, detail="请选择已上传的模型")
-    if not body.get("checkpoint"):
-        raise HTTPException(status_code=400, detail="所选模型权重无效")
-
-    cfg = config_store.get()
-    audit = apply_create_audit_iso(username)
-
-    new_cfg = InferenceInstanceConfig(
-
-        id=body.get("id") or uuid.uuid4().hex[:8],
-
-        name=body.get("name") or f"实例-{uuid.uuid4().hex[:4]}",
-
-        model_id=body.get("model_id", ""),
-
-        device_id=body.get("device_id", ""),
-
-        device_ids=body.get("device_ids") or ([body["device_id"]] if body.get("device_id") else []),
-
-        size=body.get("size") or cfg.model.size,
-
-        checkpoint=body.get("checkpoint", ""),
-
-        gpu_ids=body.get("gpu_ids") or [0],
-
-        confidence=float(body.get("confidence", cfg.model.confidence)),
-
-        resolution=int(body.get("resolution", cfg.model.resolution)),
-
-        optimize_inference=bool(body.get("optimize_inference", cfg.model.optimize_inference)),
-
-        class_names=body.get("class_names") or list(cfg.model.class_names),
-
-        created_by=audit["created_by"],
-
-        updated_by=audit["updated_by"],
-
-        created_at=audit["created_at"],
-
-        updated_at=audit["updated_at"],
-
-    )
-
-    instances = [i.model_dump(mode="json") for i in cfg.inference_instances]
-
-    instances.append(new_cfg.model_dump(mode="json"))
-
-    updated = config_store.update({"inference_instances": instances})
-
     model_manager.reload_config()
 
-    await broadcast("instances_updated", updated.model_dump())
+    updated = config_store.get()
 
-    return {"instance": new_cfg.model_dump(), "config": updated.model_dump()}
+    await broadcast("instances_updated", updated.model_dump(mode="json"))
+
+    return {"instance": new_cfg.model_dump(), "config": updated.model_dump(mode="json")}
 
 
 
@@ -384,68 +315,20 @@ async def create_instance(request: Request, body: dict[str, Any] | None = None) 
 async def update_instance(instance_id: str, request: Request, body: dict[str, Any]) -> dict[str, Any]:
 
     username = getattr(request.state, "username", "") or ""
-    audit = apply_update_audit_iso(username)
 
     db = SessionLocal()
     try:
-        body = apply_model_to_instance_config(dict(body), db)
+        update_inference_instance(db, instance_id, body, username)
     finally:
         db.close()
 
-    if not body.get("model_id"):
-        raise HTTPException(status_code=400, detail="请选择已上传的模型")
-    if not body.get("checkpoint"):
-        raise HTTPException(status_code=400, detail="所选模型权重无效")
-
-    cfg = config_store.get()
-
-    found = False
-
-    instances: list[dict[str, Any]] = []
-
-    for item in cfg.inference_instances:
-
-        data = item.model_dump(mode="json")
-
-        if item.id == instance_id:
-
-            data.update(body)
-
-            data["id"] = instance_id
-
-            data["updated_at"] = audit["updated_at"]
-
-            data["updated_by"] = audit["updated_by"]
-
-            if not data.get("created_at"):
-
-                data["created_at"] = audit["updated_at"]
-
-            if not data.get("created_by"):
-
-                data["created_by"] = username
-
-            ids = data.get("device_ids") or []
-            if not ids and data.get("device_id"):
-                ids = [data["device_id"]]
-            data["device_ids"] = ids
-            data["device_id"] = ids[0] if ids else ""
-
-            found = True
-
-        instances.append(data)
-
-    if not found:
-
-        raise HTTPException(status_code=404, detail=f"实例不存在: {instance_id}")
-
-    updated = config_store.update({"inference_instances": instances})
-
     model_manager.reload_config()
 
-    await broadcast("instances_updated", updated.model_dump())
+    updated = config_store.get()
 
-    return {"config": updated.model_dump()}
+    await broadcast("instances_updated", updated.model_dump(mode="json"))
+
+    return {"config": updated.model_dump(mode="json")}
 
 
 
@@ -455,25 +338,17 @@ async def update_instance(instance_id: str, request: Request, body: dict[str, An
 
 async def delete_instance(instance_id: str) -> dict[str, str]:
 
-    cfg = config_store.get()
-
-    if instance_id == cfg.default_instance_id:
-
-        raise HTTPException(status_code=400, detail="不能删除默认推理实例")
-
-    if not any(i.id == instance_id for i in cfg.inference_instances):
-
-        raise HTTPException(status_code=404, detail=f"实例不存在: {instance_id}")
+    db = SessionLocal()
+    try:
+        delete_inference_instance(db, instance_id)
+    finally:
+        db.close()
 
     model_manager.remove_instance(instance_id)
 
-    instances = [i.model_dump(mode="json") for i in cfg.inference_instances if i.id != instance_id]
+    config_store.reload()
 
-    config_store.update({"inference_instances": instances})
-
-    model_manager.reload_config()
-
-    await broadcast("instances_updated", config_store.get().model_dump())
+    await broadcast("instances_updated", config_store.get().model_dump(mode="json"))
 
     return {"message": f"已删除实例 {instance_id}"}
 
@@ -800,7 +675,8 @@ async def start_training(request: Request, body: dict[str, Any] | None = None) -
         finally:
             db.close()
     try:
-        training_worker.start(job_id)
+        resume = True if body is None else bool((body or {}).get("resume", True))
+        training_worker.start(job_id, resume=resume)
 
     except Exception as exc:
 
@@ -882,7 +758,7 @@ async def ws_events(websocket: WebSocket, token: str | None = Query(None)) -> No
 
     await websocket.accept()
 
-    _ws_clients.add(websocket)
+    register_ws(websocket)
 
     try:
 
@@ -898,5 +774,5 @@ async def ws_events(websocket: WebSocket, token: str | None = Query(None)) -> No
 
     finally:
 
-        _ws_clients.discard(websocket)
+        unregister_ws(websocket)
 

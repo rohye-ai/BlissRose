@@ -91,8 +91,13 @@ class InstanceAnalysisTask:
         self.message = "已停止"
 
     def _maybe_alert(self, device: DeviceRecord, result, image: Image.Image, rois: list[RoiRegion]) -> None:
-        cfg = config_store.get()
-        inst_cfg = next((i for i in cfg.inference_instances if i.id == self.instance_id), None)
+        from .instance_service import get_inference_instance
+
+        db = SessionLocal()
+        try:
+            inst_cfg = get_inference_instance(db, self.instance_id)
+        finally:
+            db.close()
         threshold = inst_cfg.confidence if inst_cfg else 0.5
         filtered = _filter_by_roi(result.detections, rois, image.width, image.height)
         qualifying = [d for d in filtered if d.confidence >= threshold]
@@ -235,8 +240,13 @@ class AnalysisWorker:
             ]
 
     def start(self, instance_id: str) -> dict[str, str]:
-        cfg = config_store.get()
-        inst_cfg = next((i for i in cfg.inference_instances if i.id == instance_id), None)
+        from .instance_service import get_inference_instance
+
+        db = SessionLocal()
+        try:
+            inst_cfg = get_inference_instance(db, instance_id)
+        finally:
+            db.close()
         if not inst_cfg:
             raise RuntimeError(f"实例不存在: {instance_id}")
         device_ids = resolve_instance_device_ids(inst_cfg)

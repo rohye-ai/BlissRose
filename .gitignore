@@ -88,3 +88,5 @@ config/user.yaml
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+docs/

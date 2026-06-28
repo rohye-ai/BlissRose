@@ -15,6 +15,7 @@ from .database import SessionLocal
 from .db_models import DatasetRecord, ModelRecord, TrainingJobRecord
 from .model_manager import infer_model_size
 from .schemas import TrainState
+from .training_checkpoints import find_resume_checkpoint, rel_checkpoint_path
 
 
 class TrainingWorker:
@@ -45,14 +46,88 @@ class TrainingWorker:
     def current_job_id(self) -> str | None:
         return self._current_job_id
 
-    def start(self, job_id: str | None = None) -> None:
+    def start(self, job_id: str | None = None, resume: bool = True) -> None:
+        with self._lock:
+            if job_id:
+                if self._state == TrainState.RUNNING:
+                    self._enqueue_job(job_id)
+                    return
+                self._start_job(job_id, resume=resume)
+            else:
+                if self._state == TrainState.RUNNING:
+                    raise RuntimeError("训练任务已在运行")
+                self._start_legacy()
+
+    def _enqueue_job(self, job_id: str) -> None:
+        db = SessionLocal()
+        try:
+            job = db.query(TrainingJobRecord).filter(TrainingJobRecord.id == job_id).first()
+            if not job:
+                raise ValueError(f"训练任务不存在: {job_id}")
+            if job.state in ("running", "completed"):
+                raise RuntimeError(f"任务状态为 {job.state}，无法加入队列")
+            if job.state != "queued":
+                job.state = "queued"
+                job.message = "已加入训练队列，等待执行"
+                audit = apply_update_audit("system")
+                job.updated_at = audit["updated_at"]
+                job.updated_by = audit["updated_by"]
+                db.commit()
+            queued = db.query(TrainingJobRecord).filter(TrainingJobRecord.state == "queued").count()
+            self._message = f"任务 {job.name} 已加入队列（排队 {queued} 个）"
+        finally:
+            db.close()
+
+    def _next_queued_job_id(self) -> str | None:
+        db = SessionLocal()
+        try:
+            job = (
+                db.query(TrainingJobRecord)
+                .filter(TrainingJobRecord.state.in_(["queued", "pending"]))
+                .order_by(TrainingJobRecord.created_at.asc())
+                .first()
+            )
+            return job.id if job else None
+        finally:
+            db.close()
+
+    def _try_start_next(self) -> None:
         with self._lock:
             if self._state == TrainState.RUNNING:
-                raise RuntimeError("训练任务已在运行")
-            if job_id:
-                self._start_job(job_id)
-            else:
-                self._start_legacy()
+                return
+        next_id = self._next_queued_job_id()
+        if not next_id:
+            with self._lock:
+                if self._state not in (TrainState.RUNNING, TrainState.STOPPING):
+                    self._state = TrainState.IDLE
+                    self._message = "队列空闲"
+            return
+        try:
+            with self._lock:
+                self._start_job(next_id)
+        except Exception as exc:
+            with self._lock:
+                self._message = f"启动队列任务失败: {exc}"
+
+    def list_queue(self) -> dict[str, Any]:
+        db = SessionLocal()
+        try:
+            rows = (
+                db.query(TrainingJobRecord)
+                .filter(TrainingJobRecord.state.in_(["queued", "pending", "running"]))
+                .order_by(TrainingJobRecord.created_at.asc())
+                .all()
+            )
+            return {
+                "running_job_id": self._current_job_id,
+                "worker_state": self._state.value,
+                "items": [
+                    {"id": r.id, "name": r.name, "state": r.state, "created_at": r.created_at.isoformat()}
+                    for r in rows
+                ],
+            }
+        finally:
+            db.close()
 
     def _start_legacy(self) -> None:
         cfg = config_store.get().training
@@ -78,6 +153,7 @@ class TrainingWorker:
         self._thread = threading.Thread(
             target=self._run_training,
             kwargs={
+                "model_type": "rf-detr",
                 "model_size": infer_model_size(model_cfg.checkpoint or ""),
                 "checkpoint": model_cfg.checkpoint,
                 "dataset": dataset,
@@ -92,7 +168,7 @@ class TrainingWorker:
         )
         self._thread.start()
 
-    def _start_job(self, job_id: str) -> None:
+    def _start_job(self, job_id: str, resume: bool = True) -> None:
         db = SessionLocal()
         try:
             job = db.query(TrainingJobRecord).filter(TrainingJobRecord.id == job_id).first()
@@ -100,6 +176,8 @@ class TrainingWorker:
                 raise ValueError(f"训练任务不存在: {job_id}")
             if job.state == "running":
                 raise RuntimeError("该训练任务已在运行")
+            if job.state == "queued":
+                pass
             model = db.query(ModelRecord).filter(ModelRecord.id == job.model_id).first()
             dataset = db.query(DatasetRecord).filter(DatasetRecord.id == job.dataset_id).first()
             if not model or not dataset:
@@ -110,29 +188,39 @@ class TrainingWorker:
             dataset_path = ROOT_DIR / dataset.path
             gpu_ids = json.loads(job.gpu_ids or "[0]")
 
+            resume_ckpt = find_resume_checkpoint(output, model.model_type) if resume else None
+            if resume and resume_ckpt:
+                job.message = f"从断点继续训练: {resume_ckpt.name}"
+            elif resume:
+                job.message = "训练进行中"
+            else:
+                job.message = "从头开始训练"
+
             job.state = "running"
-            job.message = "训练进行中"
             audit = apply_update_audit("system")
             job.updated_at = audit["updated_at"]
             job.updated_by = audit["updated_by"]
             db.commit()
 
             self._state = TrainState.RUNNING
-            self._message = f"训练任务 {job.name} 已启动"
+            self._message = f"训练任务 {job.name} 已启动" + ("（断点续训）" if resume_ckpt else "")
             self._progress = {
                 "epoch": 0,
                 "total_epochs": job.epochs,
                 "log_tail": [],
                 "job_id": job_id,
+                "resuming": bool(resume_ckpt),
             }
             self._log_path = output / "train.log"
             self._current_job_id = job_id
             self._thread = threading.Thread(
                 target=self._run_training,
                 kwargs={
+                    "model_type": model.model_type,
                     "model_size": infer_model_size(model.file_path or model.name),
                     "checkpoint": model.file_path,
                     "dataset": dataset_path,
+                    "data_yaml": dataset.data_yaml,
                     "output": output,
                     "epochs": job.epochs,
                     "batch_size": job.batch_size,
@@ -140,6 +228,7 @@ class TrainingWorker:
                     "lr": job.lr,
                     "gpu_ids": gpu_ids,
                     "job_id": job_id,
+                    "resume_checkpoint": str(resume_ckpt) if resume_ckpt else "",
                 },
                 daemon=True,
             )
@@ -170,6 +259,11 @@ class TrainingWorker:
                 if job and job.state == "running":
                     job.state = "failed"
                     job.message = "训练已手动停止"
+                    model = db.query(ModelRecord).filter(ModelRecord.id == job.model_id).first()
+                    output = ROOT_DIR / job.output_dir
+                    ckpt = find_resume_checkpoint(output, model.model_type if model else "rf-detr")
+                    if ckpt:
+                        job.checkpoint_path = rel_checkpoint_path(ckpt)
                     audit = apply_update_audit("system")
                     job.updated_at = audit["updated_at"]
                     job.updated_by = audit["updated_by"]
@@ -179,6 +273,7 @@ class TrainingWorker:
 
     def _run_training(
         self,
+        model_type: str,
         model_size: str,
         checkpoint: str,
         dataset: Path,
@@ -189,33 +284,27 @@ class TrainingWorker:
         lr: float,
         gpu_ids: list[int],
         job_id: str | None = None,
+        data_yaml: str = "",
+        resume_checkpoint: str = "",
     ) -> None:
-        script = ROOT_DIR / "backend" / "scripts" / "train_rfdetr.py"
-        cmd = [
-            sys.executable,
-            str(script),
-            "--model-size",
-            model_size,
-            "--dataset-dir",
-            str(dataset),
-            "--output-dir",
-            str(output),
-            "--epochs",
-            str(epochs),
-            "--batch-size",
-            str(batch_size),
-            "--grad-accum-steps",
-            str(grad_accum_steps),
-            "--lr",
-            str(lr),
-        ]
-        if checkpoint:
-            ckpt = ROOT_DIR / checkpoint if not Path(checkpoint).is_absolute() else Path(checkpoint)
-            if ckpt.exists():
-                cmd.extend(["--resume-checkpoint", str(ckpt)])
-
         gpu_ids = gpu_ids or [0]
-        cmd.extend(["--gpu-ids", ",".join(str(g) for g in gpu_ids)])
+        if model_type == "yolo":
+            cmd = self._build_yolo_cmd(
+                checkpoint, dataset, data_yaml, output, epochs, batch_size, lr, gpu_ids, bool(resume_checkpoint)
+            )
+        else:
+            cmd = self._build_rfdetr_cmd(
+                model_size,
+                checkpoint,
+                dataset,
+                output,
+                epochs,
+                batch_size,
+                grad_accum_steps,
+                lr,
+                gpu_ids,
+                resume_checkpoint,
+            )
 
         log_path = self._log_path or (output / "train.log")
         env = os.environ.copy()
@@ -223,8 +312,12 @@ class TrainingWorker:
         env["PYTHONUTF8"] = "1"
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
         final_code = 1
+        log_mode = "a" if resume_checkpoint and log_path.is_file() else "w"
         try:
-            with log_path.open("w", encoding="utf-8") as log_file:
+            with log_path.open(log_mode, encoding="utf-8") as log_file:
+                if log_mode == "a":
+                    log_file.write(f"\n{'=' * 60}\n[BlissRose] 断点续训 {datetime.utcnow().isoformat()}Z\n{'=' * 60}\n")
+                    log_file.flush()
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -257,35 +350,54 @@ class TrainingWorker:
 
             if job_id:
                 success = final_code == 0 and self._state != TrainState.STOPPING
-                self._finalize_job(job_id, success, output)
+                self._finalize_job(job_id, success, output, err="", model_type=model_type)
         except Exception as exc:
             with self._lock:
                 self._state = TrainState.FAILED
                 self._message = f"训练异常: {exc}"
                 self._process = None
             if job_id:
-                self._finalize_job(job_id, False, output, str(exc))
+                self._finalize_job(job_id, False, output, str(exc), model_type=model_type)
 
-    def _finalize_job(self, job_id: str, success: bool, output: Path, err: str = "") -> None:
+    def _pick_best_checkpoint(self, output: Path, model_type: str) -> Path | None:
+        if model_type == "yolo":
+            for candidate in (
+                output / "train" / "weights" / "best.pt",
+                output / "weights" / "best.pt",
+            ):
+                if candidate.is_file():
+                    return candidate
+            return find_resume_checkpoint(output, model_type)
+        for candidate in (
+            output / "checkpoint_best_total.pth",
+            output / "checkpoint_best_regular.pth",
+        ):
+            if candidate.is_file():
+                return candidate
+        return find_resume_checkpoint(output, model_type)
+
+    def _finalize_job(
+        self, job_id: str, success: bool, output: Path, err: str = "", model_type: str = "rf-detr"
+    ) -> None:
         db = SessionLocal()
         try:
             job = db.query(TrainingJobRecord).filter(TrainingJobRecord.id == job_id).first()
             if not job:
                 return
+            metrics = self._collect_training_metrics(output)
+            if metrics:
+                job.metrics_json = json.dumps(metrics, ensure_ascii=False)
             if success:
                 job.state = "completed"
                 job.message = "训练完成"
-                for name in ("checkpoint_best_regular.pth", "checkpoint_best_total.pth"):
-                    candidate = output / name
-                    if candidate.exists():
-                        try:
-                            job.checkpoint_path = str(candidate.relative_to(ROOT_DIR)).replace("\\", "/")
-                        except ValueError:
-                            job.checkpoint_path = str(candidate)
-                        break
             else:
                 job.state = "failed"
                 job.message = err or "训练失败"
+            ckpt = self._pick_best_checkpoint(output, model_type)
+            if ckpt:
+                job.checkpoint_path = rel_checkpoint_path(ckpt)
+            if not success and ckpt and not err:
+                job.message = f"{job.message}（可断点续训: {ckpt.name}）"
             job.completed_at = datetime.utcnow()
             audit = apply_update_audit("system")
             job.updated_at = audit["updated_at"]
@@ -295,6 +407,122 @@ class TrainingWorker:
             db.close()
         with self._lock:
             self._current_job_id = None
+        self._try_start_next()
+
+    def _build_rfdetr_cmd(
+        self,
+        model_size: str,
+        checkpoint: str,
+        dataset: Path,
+        output: Path,
+        epochs: int,
+        batch_size: int,
+        grad_accum_steps: int,
+        lr: float,
+        gpu_ids: list[int],
+        resume_checkpoint: str = "",
+    ) -> list[str]:
+        script = ROOT_DIR / "backend" / "scripts" / "train_rfdetr.py"
+        cmd = [
+            sys.executable,
+            str(script),
+            "--model-size",
+            model_size,
+            "--dataset-dir",
+            str(dataset),
+            "--output-dir",
+            str(output),
+            "--epochs",
+            str(epochs),
+            "--batch-size",
+            str(batch_size),
+            "--grad-accum-steps",
+            str(grad_accum_steps),
+            "--lr",
+            str(lr),
+            "--gpu-ids",
+            ",".join(str(g) for g in gpu_ids),
+        ]
+        if resume_checkpoint:
+            ckpt = Path(resume_checkpoint)
+            if ckpt.is_file():
+                cmd.extend(["--resume", str(ckpt)])
+                return cmd
+        if checkpoint:
+            ckpt = ROOT_DIR / checkpoint if not Path(checkpoint).is_absolute() else Path(checkpoint)
+            if ckpt.exists():
+                cmd.extend(["--pretrain-weights", str(ckpt)])
+        return cmd
+
+    def _build_yolo_cmd(
+        self,
+        checkpoint: str,
+        dataset: Path,
+        data_yaml: str,
+        output: Path,
+        epochs: int,
+        batch_size: int,
+        lr: float,
+        gpu_ids: list[int],
+        resume: bool = False,
+    ) -> list[str]:
+        script = ROOT_DIR / "backend" / "scripts" / "train_yolo.py"
+        yaml_path = ROOT_DIR / data_yaml if data_yaml else dataset / "data.yaml"
+        if not yaml_path.is_file():
+            yaml_path = dataset / "data.yaml"
+        ckpt = ROOT_DIR / checkpoint if checkpoint and not Path(checkpoint).is_absolute() else Path(checkpoint or "")
+        if not ckpt.exists():
+            raise FileNotFoundError(f"YOLO 权重不存在: {checkpoint}")
+        cmd = [
+            sys.executable,
+            str(script),
+            "--weights",
+            str(ckpt),
+            "--data-yaml",
+            str(yaml_path),
+            "--output-dir",
+            str(output),
+            "--epochs",
+            str(epochs),
+            "--batch-size",
+            str(batch_size),
+            "--lr",
+            str(lr),
+            "--gpu-ids",
+            ",".join(str(g) for g in gpu_ids),
+        ]
+        if resume:
+            cmd.append("--resume")
+        return cmd
+
+    def _collect_training_metrics(self, output: Path) -> dict[str, Any]:
+        metrics: dict[str, Any] = {}
+        metrics_csv = output / "metrics.csv"
+        if metrics_csv.is_file():
+            try:
+                lines = metrics_csv.read_text(encoding="utf-8").strip().splitlines()
+                if len(lines) > 1:
+                    headers = [h.strip() for h in lines[0].split(",")]
+                    last = [v.strip() for v in lines[-1].split(",")]
+                    for key, val in zip(headers, last):
+                        if key and val:
+                            try:
+                                metrics[key] = float(val)
+                            except ValueError:
+                                metrics[key] = val
+            except Exception:
+                pass
+        log_path = output / "train.log"
+        if log_path.is_file():
+            try:
+                text = log_path.read_text(encoding="utf-8", errors="replace")
+                for line in reversed(text.splitlines()):
+                    if "mAP" in line or "map" in line.lower():
+                        metrics["last_eval_line"] = line.strip()[:500]
+                        break
+            except Exception:
+                pass
+        return metrics
 
     def _parse_log_line(self, line: str) -> None:
         if not line:

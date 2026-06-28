@@ -19,8 +19,10 @@ from sqlalchemy.orm import Session
 
 from .audit import apply_create_audit, apply_update_audit, dt_to_str
 from .config import ROOT_DIR, config_store
+from .training_checkpoints import find_resume_checkpoint, resolve_output_dir
 from .db_models import (
     AlertRecord,
+    DatasetImageRecord,
     DatasetRecord,
     DeviceRecord,
     ModelLineage,
@@ -77,6 +79,175 @@ def _count_images(folder: Path) -> int:
     return sum(1 for f in folder.rglob("*") if f.suffix.lower() in exts)
 
 
+def _image_extensions() -> set[str]:
+    return {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def _find_all_images(root: Path) -> list[Path]:
+    exts = _image_extensions()
+    return sorted(f for f in root.rglob("*") if f.is_file() and f.suffix.lower() in exts)
+
+
+def _write_data_yaml(dest_dir: Path, class_names: list[str]) -> Path:
+    names = class_names or ["object"]
+    data = {
+        "path": ".",
+        "train": "train/images",
+        "val": "valid/images",
+        "test": "test/images",
+        "names": {i: n for i, n in enumerate(names)},
+    }
+    data_yaml = dest_dir / "data.yaml"
+    with data_yaml.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+    return data_yaml
+
+
+def _bootstrap_images_only_dataset(dest_dir: Path, class_names: list[str]) -> Path:
+    """将 ZIP 内纯图片整理为 YOLO 目录结构（默认全部放入 train）。"""
+    images = _find_all_images(dest_dir)
+    if not images:
+        raise HTTPException(status_code=400, detail="ZIP 中未找到图片文件")
+
+    train_images = dest_dir / "train" / "images"
+    train_labels = dest_dir / "train" / "labels"
+    valid_images = dest_dir / "valid" / "images"
+    valid_labels = dest_dir / "valid" / "labels"
+    test_images = dest_dir / "test" / "images"
+    for d in (train_images, train_labels, valid_images, valid_labels, test_images):
+        d.mkdir(parents=True, exist_ok=True)
+
+    moved: list[Path] = []
+    for img in images:
+        if "train/images" in str(img.relative_to(dest_dir)).replace("\\", "/"):
+            moved.append(img)
+            continue
+        if any(part in img.parts for part in ("train", "valid", "test")) and "images" in img.parts:
+            moved.append(img)
+            continue
+        target = train_images / img.name
+        if target.exists():
+            target = train_images / f"{img.stem}_{uuid.uuid4().hex[:4]}{img.suffix.lower()}"
+        shutil.move(str(img), str(target))
+        moved.append(target)
+
+    if not moved:
+        moved = _find_all_images(train_images)
+
+    return _write_data_yaml(dest_dir, class_names)
+
+
+def _detect_split_for_image(dataset_path: Path, image_path: Path) -> str:
+    try:
+        rel = image_path.relative_to(dataset_path).as_posix()
+    except ValueError:
+        return "train"
+    for split in ("train", "valid", "test"):
+        if rel.startswith(f"{split}/"):
+            return split
+    return "train"
+
+
+def _has_label_file(image_path: Path) -> bool:
+    label_path = _label_file_for_image(image_path)
+    return label_path.is_file() and label_path.stat().st_size > 0
+
+
+def sync_dataset_images(db: Session, dataset_id: str) -> None:
+    rec = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
+    if not rec:
+        return
+    dataset_path = ROOT_DIR / rec.path
+    exts = _image_extensions()
+    known_paths: set[str] = set()
+    for split in ("train", "valid", "test"):
+        images_dir = _split_images_dir(dataset_path, split)
+        if not images_dir.is_dir():
+            continue
+        for img in sorted(images_dir.rglob("*")):
+            if not img.is_file() or img.suffix.lower() not in exts:
+                continue
+            rel = _rel_path(img)
+            known_paths.add(rel)
+            row = (
+                db.query(DatasetImageRecord)
+                .filter(DatasetImageRecord.dataset_id == dataset_id, DatasetImageRecord.image_path == rel)
+                .first()
+            )
+            has_labels = _has_label_file(img)
+            if not row:
+                status = "labeled" if has_labels else "unlabeled"
+                db.add(
+                    DatasetImageRecord(
+                        dataset_id=dataset_id,
+                        image_path=rel,
+                        split=split,
+                        annotate_status=status,
+                    )
+                )
+            else:
+                row.split = split
+                if not has_labels:
+                    row.annotate_status = "unlabeled"
+                elif row.annotate_status == "unlabeled":
+                    row.annotate_status = "labeled"
+                row.updated_at = datetime.utcnow()
+
+    stale = db.query(DatasetImageRecord).filter(DatasetImageRecord.dataset_id == dataset_id).all()
+    for row in stale:
+        if row.image_path not in known_paths:
+            db.delete(row)
+    db.flush()
+    refresh_dataset_stats(db, dataset_id)
+
+
+def refresh_dataset_stats(db: Session, dataset_id: str) -> None:
+    rec = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
+    if not rec:
+        return
+    rows = db.query(DatasetImageRecord).filter(DatasetImageRecord.dataset_id == dataset_id).all()
+    if not rows:
+        sync_dataset_images(db, dataset_id)
+        rows = db.query(DatasetImageRecord).filter(DatasetImageRecord.dataset_id == dataset_id).all()
+
+    total = len(rows)
+    labeled = sum(1 for r in rows if r.annotate_status in ("labeled", "approved", "rejected"))
+    approved = sum(1 for r in rows if r.annotate_status == "approved")
+    unlabeled = sum(1 for r in rows if r.annotate_status == "unlabeled")
+    rec.total_count = total
+    rec.labeled_count = labeled
+    rec.unlabeled_count = unlabeled
+    rec.approved_count = approved
+    rec.train_count = _count_images(ROOT_DIR / rec.path / "train")
+    rec.valid_count = _count_images(ROOT_DIR / rec.path / "valid")
+    rec.test_count = _count_images(ROOT_DIR / rec.path / "test")
+
+    if rec.review_status not in ("approved", "rejected", "pending_review"):
+        if total == 0:
+            rec.review_status = "draft"
+        elif labeled == 0:
+            rec.review_status = "draft"
+        elif approved == total and total > 0:
+            rec.review_status = "approved"
+        else:
+            rec.review_status = "annotating"
+    db.commit()
+
+
+def _image_status_map(db: Session, dataset_id: str) -> dict[str, DatasetImageRecord]:
+    rows = db.query(DatasetImageRecord).filter(DatasetImageRecord.dataset_id == dataset_id).all()
+    return {r.image_path.replace("\\", "/"): r for r in rows}
+
+
+def _annotate_status_label(status: str) -> str:
+    return {
+        "unlabeled": "未标注",
+        "labeled": "已标注",
+        "approved": "已通过",
+        "rejected": "已驳回",
+    }.get(status, status)
+
+
 def _parse_class_names_from_yaml(data_yaml: Path) -> list[str]:
     if not data_yaml.exists():
         return []
@@ -91,16 +262,14 @@ def _parse_class_names_from_yaml(data_yaml: Path) -> list[str]:
 
 
 def _model_in_use(db: Session, model_id: str) -> bool:
+    from .instance_service import instance_references_model
+
     rec = db.query(ModelRecord).filter(ModelRecord.id == model_id).first()
-    cfg = config_store.get()
-    for inst in cfg.inference_instances:
-        if inst.model_id == model_id:
-            return True
-        if rec and inst.checkpoint and inst.checkpoint.replace("\\", "/") == rec.file_path.replace("\\", "/"):
-            return True
+    if instance_references_model(db, model_id, rec.file_path if rec else ""):
+        return True
     jobs = db.query(TrainingJobRecord).filter(
         TrainingJobRecord.model_id == model_id,
-        TrainingJobRecord.state.in_(["pending", "running"]),
+        TrainingJobRecord.state.in_(["pending", "queued", "running"]),
     ).count()
     return jobs > 0
 
@@ -115,6 +284,8 @@ def model_to_out(db: Session, rec: ModelRecord) -> ModelRecordOut:
         parent_id=rec.parent_id,
         source=rec.source,
         version=rec.version,
+        stage=getattr(rec, "stage", None) or "staging",
+        metrics=_json_loads(getattr(rec, "metrics_json", None) or "{}", {}),
         in_use=_model_in_use(db, rec.id),
         uploaded_by=rec.uploaded_by or "",
         created_at=_dt_str(rec.created_at),
@@ -127,6 +298,13 @@ def dataset_to_out(rec: DatasetRecord) -> DatasetRecordOut:
         name=rec.name,
         path=rec.path,
         data_yaml=rec.data_yaml,
+        format=getattr(rec, "format", None) or "yolo",
+        review_status=getattr(rec, "review_status", None) or "draft",
+        total_count=getattr(rec, "total_count", 0) or 0,
+        labeled_count=getattr(rec, "labeled_count", 0) or 0,
+        unlabeled_count=getattr(rec, "unlabeled_count", 0) or 0,
+        approved_count=getattr(rec, "approved_count", 0) or 0,
+        train_ready=(getattr(rec, "review_status", None) or "draft") == "approved",
         class_names=_json_loads(rec.class_names, []),
         train_count=rec.train_count,
         valid_count=rec.valid_count,
@@ -158,7 +336,9 @@ def device_to_out(rec: DeviceRecord, analysis_running: bool = False) -> DeviceRe
 def alert_to_out(db: Session, rec: AlertRecord) -> AlertRecordOut:
     device = db.query(DeviceRecord).filter(DeviceRecord.id == rec.device_id).first()
     cfg = config_store.get()
-    inst_cfg = next((i for i in cfg.inference_instances if i.id == rec.instance_id), None)
+    from .instance_service import get_inference_instance
+
+    inst_cfg = get_inference_instance(db, rec.instance_id)
     dets_raw = _json_loads(rec.detections, [])
     detections = [DetectionItem(**d) for d in dets_raw if isinstance(d, dict)]
     rel = rec.image_path.replace("\\", "/")
@@ -178,6 +358,8 @@ def alert_to_out(db: Session, rec: AlertRecord) -> AlertRecordOut:
 def training_job_to_out(db: Session, job: TrainingJobRecord) -> TrainingJobOut:
     model = db.query(ModelRecord).filter(ModelRecord.id == job.model_id).first()
     dataset = db.query(DatasetRecord).filter(DatasetRecord.id == job.dataset_id).first()
+    output = resolve_output_dir(job.output_dir)
+    can_resume = find_resume_checkpoint(output, model.model_type if model else "rf-detr") is not None
     return TrainingJobOut(
         id=job.id,
         name=job.name,
@@ -193,7 +375,9 @@ def training_job_to_out(db: Session, job: TrainingJobRecord) -> TrainingJobOut:
         lr=job.lr,
         gpu_ids=_json_loads(job.gpu_ids, [0]),
         checkpoint_path=job.checkpoint_path,
+        can_resume=can_resume,
         deployed_model_id=job.deployed_model_id,
+        metrics=_json_loads(getattr(job, "metrics_json", None) or "{}", {}),
         message=job.message,
         created_by=job.created_by or "",
         updated_by=job.updated_by or "",
@@ -256,11 +440,24 @@ def apply_model_to_instance_config(body: dict[str, Any], db: Session) -> dict[st
     rec = resolve_model_for_instance(model_id, db)
     assert rec is not None
     body["checkpoint"] = rec.file_path
+    body["model_type"] = rec.model_type
     body["size"] = rec.size or infer_model_size(rec.file_path or rec.name)
     names = _json_loads(rec.class_names, [])
     if names:
         body["class_names"] = names
     return body
+
+
+def set_model_stage(db: Session, model_id: str, stage: str) -> ModelRecordOut:
+    if stage not in ("staging", "production", "archived"):
+        raise HTTPException(status_code=400, detail="stage 必须为 staging / production / archived")
+    rec = db.query(ModelRecord).filter(ModelRecord.id == model_id).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="模型不存在")
+    rec.stage = stage
+    db.commit()
+    db.refresh(rec)
+    return model_to_out(db, rec)
 
 
 async def upload_model(
@@ -310,10 +507,10 @@ def delete_model(db: Session, model_id: str) -> None:
     children = db.query(ModelRecord).filter(ModelRecord.parent_id == model_id).count()
     if children:
         raise HTTPException(status_code=400, detail="存在派生模型，无法删除")
-    cfg = config_store.get()
-    for inst in cfg.inference_instances:
-        if inst.checkpoint and inst.checkpoint.replace("\\", "/") == rec.file_path.replace("\\", "/"):
-            raise HTTPException(status_code=400, detail="模型权重已被推理实例引用，无法删除")
+    from .instance_service import instance_references_model
+
+    if instance_references_model(db, model_id, rec.file_path):
+        raise HTTPException(status_code=400, detail="模型已被推理实例引用，无法删除")
 
     model_dir = ROOT_DIR / rec.file_path
     if model_dir.parent.name == model_id and model_dir.parent.parent.name == "models":
@@ -328,7 +525,13 @@ def delete_model(db: Session, model_id: str) -> None:
     db.commit()
 
 
-async def upload_dataset_zip(db: Session, file: UploadFile, name: str, uploaded_by: str = "") -> DatasetRecordOut:
+async def upload_dataset_zip(
+    db: Session,
+    file: UploadFile,
+    name: str,
+    uploaded_by: str = "",
+    class_names: list[str] | None = None,
+) -> DatasetRecordOut:
     dataset_id = uuid.uuid4().hex[:8]
     dest_dir = DATASETS_DIR / dataset_id
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -350,24 +553,32 @@ async def upload_dataset_zip(db: Session, file: UploadFile, name: str, uploaded_
         for candidate in dest_dir.rglob("data.yaml"):
             data_yaml = candidate
             break
-    if not data_yaml.exists():
-        shutil.rmtree(dest_dir, ignore_errors=True)
-        raise HTTPException(status_code=400, detail="ZIP 中缺少 data.yaml")
 
-    for sub in ("train", "valid", "test"):
-        if not (dest_dir / sub).is_dir() and not any(dest_dir.rglob(sub)):
-            pass
+    dataset_format = "yolo"
+    names: list[str] = []
+    if not data_yaml.exists():
+        names = class_names or ["object"]
+        data_yaml = _bootstrap_images_only_dataset(dest_dir, names)
+        dataset_format = "images"
+    else:
+        names = _parse_class_names_from_yaml(data_yaml)
+        if class_names:
+            names = class_names
+            _write_data_yaml(data_yaml.parent, names)
+
     train_count = _count_images(dest_dir / "train")
     valid_count = _count_images(dest_dir / "valid")
     test_count = _count_images(dest_dir / "test")
-    class_names = _parse_class_names_from_yaml(data_yaml)
+    class_names_final = names or _parse_class_names_from_yaml(data_yaml)
 
     rec = DatasetRecord(
         id=dataset_id,
         name=name or f"数据集-{dataset_id[:4]}",
         path=_rel_path(dest_dir),
         data_yaml=_rel_path(data_yaml),
-        class_names=json.dumps(class_names, ensure_ascii=False),
+        format=dataset_format,
+        review_status="draft",
+        class_names=json.dumps(class_names_final, ensure_ascii=False),
         train_count=train_count,
         valid_count=valid_count,
         test_count=test_count,
@@ -375,6 +586,8 @@ async def upload_dataset_zip(db: Session, file: UploadFile, name: str, uploaded_
     )
     db.add(rec)
     db.commit()
+    db.refresh(rec)
+    sync_dataset_images(db, dataset_id)
     db.refresh(rec)
     return dataset_to_out(rec)
 
@@ -402,7 +615,7 @@ def browse_dataset(db: Session, dataset_id: str, split: str = "train", page: int
         raise HTTPException(status_code=404, detail="数据集不存在")
     if split not in ("train", "valid", "test"):
         raise HTTPException(status_code=400, detail="split 必须为 train/valid/test")
-    all_items = _collect_dataset_images(ROOT_DIR / rec.path, split, dataset_id)
+    all_items = _collect_dataset_images(db, dataset_id, ROOT_DIR / rec.path, split)
     total = len(all_items)
     start = (page - 1) * page_size
     slice_items = all_items[start : start + page_size]
@@ -425,39 +638,134 @@ def _label_file_for_image(image_path: Path) -> Path:
     return image_path.parent / "labels" / f"{image_path.stem}.txt"
 
 
-def _collect_dataset_images(dataset_path: Path, split: str, dataset_id: str) -> list[dict[str, Any]]:
+def _collect_dataset_images(
+    db: Session,
+    dataset_id: str,
+    dataset_path: Path,
+    split: str,
+    status_filter: str = "all",
+) -> list[dict[str, Any]]:
     images_dir = _split_images_dir(dataset_path, split)
-    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    exts = _image_extensions()
+    if not images_dir.is_dir():
+        return []
     images = sorted(f for f in images_dir.rglob("*") if f.suffix.lower() in exts)
+    status_map = _image_status_map(db, dataset_id)
     items: list[dict[str, Any]] = []
     for img in images:
         rel = _rel_path(img)
+        rel_norm = rel.replace("\\", "/")
         label_file = _label_file_for_image(img)
+        has_labels = label_file.is_file() and label_file.stat().st_size > 0
+        row = status_map.get(rel_norm)
+        annotate_status = row.annotate_status if row else ("labeled" if has_labels else "unlabeled")
+        if status_filter == "unlabeled" and annotate_status != "unlabeled":
+            continue
+        if status_filter == "labeled" and annotate_status not in ("labeled", "approved", "rejected"):
+            continue
+        if status_filter == "approved" and annotate_status != "approved":
+            continue
+        if status_filter == "pending" and annotate_status != "labeled":
+            continue
         items.append({
             "path": rel,
             "name": img.name,
             "url": f"/api/platform/datasets/{dataset_id}/file?path={quote(rel, safe='')}",
-            "has_labels": label_file.is_file() and label_file.stat().st_size > 0,
+            "has_labels": has_labels,
+            "annotate_status": annotate_status,
+            "annotate_status_label": _annotate_status_label(annotate_status),
         })
     return items
 
 
-def list_dataset_images(db: Session, dataset_id: str, split: str = "train") -> dict[str, Any]:
+def list_dataset_images(
+    db: Session,
+    dataset_id: str,
+    split: str = "train",
+    status_filter: str = "all",
+    page: int = 1,
+    page_size: int = 50,
+    search: str = "",
+) -> dict[str, Any]:
     rec = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
     if not rec:
         raise HTTPException(status_code=404, detail="数据集不存在")
     if split not in ("train", "valid", "test"):
         raise HTTPException(status_code=400, detail="split 必须为 train/valid/test")
-    items = _collect_dataset_images(ROOT_DIR / rec.path, split, dataset_id)
+    sync_dataset_images(db, dataset_id)
+    db.refresh(rec)
+    items = _collect_dataset_images(db, dataset_id, ROOT_DIR / rec.path, split, status_filter)
+    if search.strip():
+        q = search.strip().lower()
+        items = [i for i in items if q in i.get("name", "").lower()]
+    total = len(items)
+    page = max(1, page)
+    page_size = max(1, min(page_size, 200))
+    start = (page - 1) * page_size
+    page_items = items[start : start + page_size]
     labeled = sum(1 for i in items if i.get("has_labels"))
+    approved = sum(1 for i in items if i.get("annotate_status") == "approved")
     return {
         "dataset_id": dataset_id,
         "dataset_name": rec.name,
         "split": split,
-        "total": len(items),
+        "status_filter": status_filter,
+        "search": search.strip(),
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, (total + page_size - 1) // page_size) if total else 1,
         "labeled_count": labeled,
+        "approved_count": approved,
+        "unlabeled_count": sum(1 for i in items if i.get("annotate_status") == "unlabeled"),
+        "review_status": rec.review_status,
+        "train_ready": rec.review_status == "approved",
         "class_names": _json_loads(rec.class_names, []),
-        "items": items,
+        "stats": {
+            "total_count": rec.total_count,
+            "labeled_count": rec.labeled_count,
+            "unlabeled_count": rec.unlabeled_count,
+            "approved_count": rec.approved_count,
+        },
+        "items": page_items,
+    }
+
+
+def find_next_unlabeled_image(
+    db: Session,
+    dataset_id: str,
+    split: str = "train",
+    current_path: str = "",
+    page_size: int = 50,
+) -> dict[str, Any]:
+    rec = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    if split not in ("train", "valid", "test"):
+        raise HTTPException(status_code=400, detail="split 必须为 train/valid/test")
+    items = _collect_dataset_images(db, dataset_id, ROOT_DIR / rec.path, split, "unlabeled")
+    if not items:
+        return {"found": False}
+    current_norm = (current_path or "").replace("\\", "/")
+    start_idx = 0
+    if current_norm:
+        paths = [i["path"].replace("\\", "/") for i in items]
+        try:
+            cur = paths.index(current_norm)
+            start_idx = (cur + 1) % len(items)
+        except ValueError:
+            start_idx = 0
+    target = items[start_idx]
+    global_idx = start_idx
+    page = global_idx // page_size + 1
+    index_in_page = global_idx % page_size
+    return {
+        "found": True,
+        "path": target["path"],
+        "name": target["name"],
+        "page": page,
+        "index_in_page": index_in_page,
+        "global_index": global_idx,
     }
 
 
@@ -494,11 +802,18 @@ def get_image_labels(db: Session, dataset_id: str, image_path: str) -> dict[str,
     if not rec:
         raise HTTPException(status_code=404, detail="数据集不存在")
     target = resolve_dataset_file(dataset_id, image_path)
-    if target.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+    if target.suffix.lower() not in _image_extensions():
         raise HTTPException(status_code=400, detail="不是有效的图片路径")
     class_names = _json_loads(rec.class_names, [])
     label_path = _label_file_for_image(target)
     annotations = _parse_yolo_label_file(label_path, class_names)
+    rel = image_path.replace("\\", "/")
+    row = (
+        db.query(DatasetImageRecord)
+        .filter(DatasetImageRecord.dataset_id == dataset_id, DatasetImageRecord.image_path == rel)
+        .first()
+    )
+    status = row.annotate_status if row else ("labeled" if annotations else "unlabeled")
     return {
         "path": image_path,
         "name": target.name,
@@ -506,6 +821,245 @@ def get_image_labels(db: Session, dataset_id: str, image_path: str) -> dict[str,
         "label_path": _rel_path(label_path) if label_path.is_file() else "",
         "class_names": class_names,
         "annotations": annotations,
+        "annotate_status": status,
+        "annotate_status_label": _annotate_status_label(status),
+        "review_status": rec.review_status,
+    }
+
+
+def _annotations_to_yolo_lines(annotations: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for ann in annotations:
+        cid = int(ann.get("class_id", 0))
+        cx = float(ann.get("cx", 0))
+        cy = float(ann.get("cy", 0))
+        w = float(ann.get("w", 0))
+        h = float(ann.get("h", 0))
+        lines.append(f"{cid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def save_image_labels(
+    db: Session,
+    dataset_id: str,
+    image_path: str,
+    annotations: list[dict[str, Any]],
+    class_names: list[str] | None = None,
+) -> dict[str, Any]:
+    rec = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    target = resolve_dataset_file(dataset_id, image_path)
+    label_path = _label_file_for_image(target)
+    label_path.parent.mkdir(parents=True, exist_ok=True)
+    label_path.write_text(_annotations_to_yolo_lines(annotations), encoding="utf-8")
+    if class_names is not None:
+        rec.class_names = json.dumps(class_names, ensure_ascii=False)
+        yaml_path = ROOT_DIR / rec.data_yaml if rec.data_yaml else ROOT_DIR / rec.path / "data.yaml"
+        if yaml_path.is_file():
+            _write_data_yaml(yaml_path.parent, class_names)
+    if rec.review_status == "approved":
+        rec.review_status = "annotating"
+    rel = image_path.replace("\\", "/")
+    row = (
+        db.query(DatasetImageRecord)
+        .filter(DatasetImageRecord.dataset_id == dataset_id, DatasetImageRecord.image_path == rel)
+        .first()
+    )
+    if not row:
+        row = DatasetImageRecord(
+            dataset_id=dataset_id,
+            image_path=rel,
+            split=_detect_split_for_image(ROOT_DIR / rec.path, target),
+        )
+        db.add(row)
+    row.annotate_status = "labeled" if annotations else "unlabeled"
+    row.updated_at = datetime.utcnow()
+    row.reviewed_by = ""
+    row.reviewed_at = None
+    db.commit()
+    refresh_dataset_stats(db, dataset_id)
+    result = get_image_labels(db, dataset_id, image_path)
+    row = db.query(DatasetImageRecord).filter(DatasetImageRecord.dataset_id == dataset_id, DatasetImageRecord.image_path == rel).first()
+    if row:
+        result["annotate_status"] = row.annotate_status
+        result["annotate_status_label"] = _annotate_status_label(row.annotate_status)
+    return result
+
+
+def delete_image_labels(db: Session, dataset_id: str, image_path: str) -> dict[str, str]:
+    rec = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    target = resolve_dataset_file(dataset_id, image_path)
+    label_path = _label_file_for_image(target)
+    if label_path.is_file():
+        label_path.unlink()
+    if rec.review_status == "approved":
+        rec.review_status = "annotating"
+    rel = image_path.replace("\\", "/")
+    row = (
+        db.query(DatasetImageRecord)
+        .filter(DatasetImageRecord.dataset_id == dataset_id, DatasetImageRecord.image_path == rel)
+        .first()
+    )
+    if row:
+        row.annotate_status = "unlabeled"
+        row.updated_at = datetime.utcnow()
+        row.reviewed_by = ""
+        row.reviewed_at = None
+    db.commit()
+    refresh_dataset_stats(db, dataset_id)
+    return {"message": "标注已删除"}
+
+
+def update_dataset_class_names(db: Session, dataset_id: str, class_names: list[str]) -> DatasetRecordOut:
+    rec = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    if not class_names:
+        raise HTTPException(status_code=400, detail="至少保留一个类别")
+    rec.class_names = json.dumps(class_names, ensure_ascii=False)
+    yaml_path = ROOT_DIR / rec.data_yaml if rec.data_yaml else ROOT_DIR / rec.path / "data.yaml"
+    if yaml_path.is_file():
+        _write_data_yaml(yaml_path.parent, class_names)
+    db.commit()
+    db.refresh(rec)
+    return dataset_to_out(rec)
+
+
+def submit_dataset_review(db: Session, dataset_id: str) -> DatasetRecordOut:
+    rec = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    sync_dataset_images(db, dataset_id)
+    db.refresh(rec)
+    if rec.labeled_count <= 0:
+        raise HTTPException(status_code=400, detail="尚无已标注图片，无法提交审核")
+    rec.review_status = "pending_review"
+    db.commit()
+    db.refresh(rec)
+    return dataset_to_out(rec)
+
+
+def approve_dataset_review(db: Session, dataset_id: str, username: str = "") -> DatasetRecordOut:
+    rec = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    rows = (
+        db.query(DatasetImageRecord)
+        .filter(DatasetImageRecord.dataset_id == dataset_id, DatasetImageRecord.annotate_status == "labeled")
+        .all()
+    )
+    now = datetime.utcnow()
+    for row in rows:
+        row.annotate_status = "approved"
+        row.reviewed_by = username or "system"
+        row.reviewed_at = now
+    rec.review_status = "approved"
+    db.commit()
+    refresh_dataset_stats(db, dataset_id)
+    db.refresh(rec)
+    return dataset_to_out(rec)
+
+
+def reject_dataset_review(db: Session, dataset_id: str, message: str = "") -> DatasetRecordOut:
+    rec = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    rec.review_status = "rejected"
+    db.commit()
+    db.refresh(rec)
+    return dataset_to_out(rec)
+
+
+def review_dataset_image(
+    db: Session,
+    dataset_id: str,
+    image_path: str,
+    action: str,
+    username: str = "",
+) -> dict[str, Any]:
+    rec = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    rel = image_path.replace("\\", "/")
+    row = (
+        db.query(DatasetImageRecord)
+        .filter(DatasetImageRecord.dataset_id == dataset_id, DatasetImageRecord.image_path == rel)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="图片记录不存在")
+    if row.annotate_status == "unlabeled":
+        raise HTTPException(status_code=400, detail="未标注图片无法审核")
+    if action == "approve":
+        row.annotate_status = "approved"
+    elif action == "reject":
+        row.annotate_status = "rejected"
+    else:
+        raise HTTPException(status_code=400, detail="action 必须为 approve 或 reject")
+    row.reviewed_by = username or ""
+    row.reviewed_at = datetime.utcnow()
+    if rec.review_status == "approved":
+        rec.review_status = "pending_review"
+    db.commit()
+    refresh_dataset_stats(db, dataset_id)
+    db.refresh(rec)
+    return {
+        "path": image_path,
+        "annotate_status": row.annotate_status,
+        "annotate_status_label": _annotate_status_label(row.annotate_status),
+        "review_status": rec.review_status,
+    }
+
+
+def pre_annotate_image(
+    db: Session,
+    dataset_id: str,
+    image_path: str,
+    instance_id: str,
+    confidence: float | None = None,
+    save: bool = False,
+) -> dict[str, Any]:
+    """使用推理实例对图片预标注（参考 EasyAIoT 自动标注能力）。"""
+    from .model_manager import model_manager
+
+    rec = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    target = resolve_dataset_file(dataset_id, image_path)
+    if not model_manager.is_ready(instance_id):
+        raise HTTPException(status_code=400, detail=f"推理实例 {instance_id} 未就绪，请先启动")
+
+    image = Image.open(target).convert("RGB")
+    result = model_manager.get(instance_id).predict_pil(image, confidence, False)
+    class_names = _json_loads(rec.class_names, [])
+    w, h = image.size
+    annotations: list[dict[str, Any]] = []
+    for det in result.detections:
+        x1, y1, x2, y2 = det.bbox
+        cx = ((x1 + x2) / 2) / w
+        cy = ((y1 + y2) / 2) / h
+        bw = (x2 - x1) / w
+        bh = (y2 - y1) / h
+        annotations.append({
+            "class_id": det.class_id,
+            "class_name": det.class_name,
+            "cx": cx,
+            "cy": cy,
+            "w": bw,
+            "h": bh,
+        })
+    if save and annotations:
+        save_image_labels(db, dataset_id, image_path, annotations, class_names)
+    return {
+        "path": image_path,
+        "instance_id": instance_id,
+        "saved": bool(save and annotations),
+        "count": len(annotations),
+        "annotations": annotations,
+        "class_names": class_names,
     }
 
 
@@ -579,7 +1133,9 @@ def delete_device(db: Session, device_id: str) -> None:
     if analysis_worker.is_device_running(device_id):
         raise HTTPException(status_code=400, detail="设备正在分析中，请先停止")
     cfg = config_store.get()
-    for inst in cfg.inference_instances:
+    from .instance_service import list_inference_instances
+
+    for inst in list_inference_instances(db):
         bound = list(inst.device_ids or [])
         if inst.device_id and inst.device_id not in bound:
             bound.append(inst.device_id)
@@ -675,6 +1231,22 @@ def create_alert(
     db.add(rec)
     db.commit()
     db.refresh(rec)
+
+    from .instance_service import get_inference_instance
+    from .webhook_service import dispatch_alert_webhooks
+
+    inst_cfg = get_inference_instance(db, instance_id)
+    inst_name = inst_cfg.name if inst_cfg else instance_id
+    det_dicts = [d.model_dump() for d in detections]
+    dispatch_alert_webhooks(
+        alert_id=rec.id,
+        device_id=device_id,
+        instance_id=instance_id,
+        instance_name=inst_name,
+        max_confidence=max_confidence,
+        detections=det_dicts,
+        alert_at=rec.alert_at.isoformat() if rec.alert_at else "",
+    )
     return rec
 
 
@@ -739,19 +1311,35 @@ def get_training_job_log(db: Session, job_id: str) -> dict[str, Any]:
     }
 
 
+def _assert_dataset_train_ready(db: Session, dataset_id: str) -> DatasetRecord:
+    dataset = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    if dataset.review_status != "approved":
+        status_labels = {
+            "draft": "草稿",
+            "annotating": "标注中",
+            "pending_review": "待审核",
+            "rejected": "已驳回",
+        }
+        label = status_labels.get(dataset.review_status, dataset.review_status)
+        raise HTTPException(
+            status_code=400,
+            detail=f"数据集「{dataset.name}」尚未审核通过（{label}），请完成标注并审核后再训练",
+        )
+    return dataset
+
+
 def create_training_job(db: Session, body: dict[str, Any], username: str = "") -> TrainingJobOut:
     model_id = body.get("model_id")
     dataset_id = body.get("dataset_id")
     if not model_id or not dataset_id:
         raise HTTPException(status_code=400, detail="请选择模型和数据集")
     model = db.query(ModelRecord).filter(ModelRecord.id == model_id).first()
-    dataset = db.query(DatasetRecord).filter(DatasetRecord.id == dataset_id).first()
     if not model:
         raise HTTPException(status_code=404, detail="模型不存在")
-    if not dataset:
-        raise HTTPException(status_code=404, detail="数据集不存在")
-    if model.model_type != "rf-detr":
-        raise HTTPException(status_code=400, detail="当前仅支持 RF-DETR 模型训练")
+    sync_dataset_images(db, dataset_id)
+    _assert_dataset_train_ready(db, dataset_id)
 
     job_id = uuid.uuid4().hex[:8]
     output_dir = TRAIN_OUTPUT_BASE / job_id
@@ -776,6 +1364,71 @@ def create_training_job(db: Session, body: dict[str, Any], username: str = "") -
         updated_at=audit["updated_at"],
     )
     db.add(job)
+    db.commit()
+    db.refresh(job)
+    out = training_job_to_out(db, job)
+    if body.get("auto_start", True):
+        from .training_worker import training_worker
+
+        try:
+            training_worker.start(job.id)
+            db.refresh(job)
+            out = training_job_to_out(db, job)
+        except Exception as exc:
+            job.message = str(exc)
+            db.commit()
+    return out
+
+
+def update_training_job(
+    db: Session, job_id: str, body: dict[str, Any], username: str = ""
+) -> TrainingJobOut:
+    from .training_worker import training_worker
+
+    job = db.query(TrainingJobRecord).filter(TrainingJobRecord.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    if job.state == "running":
+        raise HTTPException(status_code=400, detail="训练任务运行中，无法修改")
+    if training_worker.state == TrainState.RUNNING and training_worker.current_job_id == job_id:
+        raise HTTPException(status_code=400, detail="训练任务运行中，无法修改")
+    if job.state not in ("pending", "failed", "queued"):
+        raise HTTPException(status_code=400, detail="仅待训练、排队中或失败状态的任务可修改")
+    if job.deployed_model_id:
+        raise HTTPException(status_code=400, detail="已部署的任务不可修改")
+
+    if "name" in body and body["name"]:
+        job.name = str(body["name"]).strip()
+    if "model_id" in body:
+        model_id = body["model_id"]
+        model = db.query(ModelRecord).filter(ModelRecord.id == model_id).first()
+        if not model:
+            raise HTTPException(status_code=404, detail="模型不存在")
+        job.model_id = model_id
+    if "dataset_id" in body:
+        dataset_id = body["dataset_id"]
+        if dataset_id != job.dataset_id:
+            _assert_dataset_train_ready(db, dataset_id)
+            job.dataset_id = dataset_id
+    if "epochs" in body:
+        job.epochs = max(1, int(body["epochs"]))
+    if "batch_size" in body:
+        job.batch_size = max(1, int(body["batch_size"]))
+    if "grad_accum_steps" in body:
+        job.grad_accum_steps = max(1, int(body["grad_accum_steps"]))
+    if "lr" in body:
+        job.lr = float(body["lr"])
+    if "gpu_ids" in body:
+        gpu_ids = body["gpu_ids"] or [0]
+        job.gpu_ids = json.dumps(gpu_ids)
+
+    if job.state in ("failed", "queued"):
+        job.state = "pending"
+        job.message = ""
+
+    audit = apply_update_audit(username)
+    job.updated_at = audit["updated_at"]
+    job.updated_by = audit["updated_by"]
     db.commit()
     db.refresh(job)
     return training_job_to_out(db, job)
@@ -826,6 +1479,7 @@ def deploy_training_job(db: Session, job_id: str, uploaded_by: str = "") -> Mode
         parent_id=job.model_id,
         source="deploy",
         version=version,
+        metrics_json=job.metrics_json or "{}",
         uploaded_by=uploaded_by or "",
     )
     db.add(rec)

@@ -90,6 +90,8 @@ class ModelRecord(Base):
     parent_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("models.id"), nullable=True)
     source: Mapped[str] = mapped_column(String(16), default="upload")  # upload | deploy
     version: Mapped[str] = mapped_column(String(64), default="v1")
+    stage: Mapped[str] = mapped_column(String(16), default="staging", index=True)  # staging | production | archived
+    metrics_json: Mapped[str] = mapped_column(Text, default="{}")
     uploaded_by: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -112,12 +114,33 @@ class DatasetRecord(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     path: Mapped[str] = mapped_column(String(512), nullable=False)
     data_yaml: Mapped[str] = mapped_column(String(512), default="")
+    format: Mapped[str] = mapped_column(String(16), default="yolo")  # yolo | images
+    review_status: Mapped[str] = mapped_column(String(16), default="draft", index=True)
+    total_count: Mapped[int] = mapped_column(Integer, default=0)
+    labeled_count: Mapped[int] = mapped_column(Integer, default=0)
+    unlabeled_count: Mapped[int] = mapped_column(Integer, default=0)
+    approved_count: Mapped[int] = mapped_column(Integer, default=0)
     class_names: Mapped[str] = mapped_column(Text, default="[]")
     train_count: Mapped[int] = mapped_column(Integer, default=0)
     valid_count: Mapped[int] = mapped_column(Integer, default=0)
     test_count: Mapped[int] = mapped_column(Integer, default=0)
     uploaded_by: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class DatasetImageRecord(Base):
+    """Per-image annotation and review status."""
+
+    __tablename__ = "dataset_images"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    dataset_id: Mapped[str] = mapped_column(String(32), ForeignKey("datasets.id", ondelete="CASCADE"), index=True)
+    image_path: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    split: Mapped[str] = mapped_column(String(16), default="train")
+    annotate_status: Mapped[str] = mapped_column(String(16), default="unlabeled", index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    reviewed_by: Mapped[str] = mapped_column(String(64), default="")
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class DeviceRecord(Base):
@@ -130,6 +153,30 @@ class DeviceRecord(Base):
     poll_interval: Mapped[int] = mapped_column(Integer, default=5)
     roi: Mapped[str] = mapped_column(Text, default="[]")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by: Mapped[str] = mapped_column(String(64), default="")
+    updated_by: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class InferenceInstanceRecord(Base):
+    """推理实例配置（单一数据源，替代 app_config JSON 中的 inference_instances）。"""
+
+    __tablename__ = "inference_instances"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    model_id: Mapped[str] = mapped_column(String(32), default="", index=True)
+    model_type: Mapped[str] = mapped_column(String(16), default="rf-detr")
+    device_ids: Mapped[str] = mapped_column(Text, default="[]")
+    size: Mapped[str] = mapped_column(String(32), default="medium")
+    checkpoint: Mapped[str] = mapped_column(String(512), default="")
+    gpu_ids: Mapped[str] = mapped_column(Text, default="[0]")
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    resolution: Mapped[int] = mapped_column(Integer, default=576)
+    optimize_inference: Mapped[bool] = mapped_column(Boolean, default=True)
+    class_names: Mapped[str] = mapped_column(Text, default="[]")
     created_by: Mapped[str] = mapped_column(String(64), default="")
     updated_by: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -166,6 +213,7 @@ class TrainingJobRecord(Base):
     checkpoint_path: Mapped[str] = mapped_column(String(512), default="")
     deployed_model_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     message: Mapped[str] = mapped_column(Text, default="")
+    metrics_json: Mapped[str] = mapped_column(Text, default="{}")
     created_by: Mapped[str] = mapped_column(String(64), default="")
     updated_by: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

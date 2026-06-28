@@ -78,24 +78,7 @@ class ConfigStore:
             db_data = _deep_merge(defaults, db_data)
 
         model = ModelConfig(**(db_data.get("model") or {}))
-        instances_raw = db_data.get("inference_instances") or []
-        if not instances_raw:
-            instances_raw = [
-                {
-                    "id": "default",
-                    "name": "默认推理实例",
-                    "size": model.size.value,
-                    "checkpoint": model.checkpoint,
-                    "gpu_ids": _parse_gpu_ids_from_device(model.device),
-                    "confidence": model.confidence,
-                    "resolution": model.resolution,
-                    "optimize_inference": model.optimize_inference,
-                    "class_names": model.class_names,
-                }
-            ]
-
-        instances = [InferenceInstanceConfig(**item) for item in instances_raw]
-        default_id = db_data.get("default_instance_id") or "default"
+        instances, default_id = self._load_instances_from_db(model, db_data)
         if not any(i.id == default_id for i in instances) and instances:
             default_id = instances[0].id
 
@@ -106,6 +89,37 @@ class ConfigStore:
             inference_instances=instances,
             default_instance_id=default_id,
         )
+
+    def _load_instances_from_db(self, model: ModelConfig, db_data: dict[str, Any]) -> tuple[list[InferenceInstanceConfig], str]:
+        from .database import Base, engine
+        from .instance_service import list_inference_instances, migrate_instances_from_json
+        from .db_models import InferenceInstanceRecord
+
+        Base.metadata.create_all(bind=engine)
+        db = SessionLocal()
+        try:
+            migrate_instances_from_json(db)
+            instances = list_inference_instances(db)
+            default_id = db_data.get("default_instance_id") or "default"
+            if not instances:
+                rec = InferenceInstanceRecord(
+                    id=default_id if default_id != "default" else "default",
+                    name="默认推理实例",
+                    size=model.size.value,
+                    checkpoint=model.checkpoint,
+                    gpu_ids=json.dumps(_parse_gpu_ids_from_device(model.device)),
+                    confidence=model.confidence,
+                    resolution=model.resolution,
+                    optimize_inference=model.optimize_inference,
+                    class_names=json.dumps(model.class_names, ensure_ascii=False),
+                )
+                db.add(rec)
+                db.commit()
+                instances = list_inference_instances(db)
+                default_id = instances[0].id if instances else "default"
+            return instances, default_id
+        finally:
+            db.close()
 
     def get(self) -> AppConfig:
         with self._lock:
@@ -118,10 +132,14 @@ class ConfigStore:
 
     def update(self, patch: dict[str, Any]) -> AppConfig:
         with self._lock:
+            # inference_instances 已入库，忽略 JSON 中的实例 patch
+            patch = {k: v for k, v in patch.items() if k != "inference_instances"}
             current = self._config.model_dump(mode="json")
             merged = _deep_merge(current, patch)
             self._config = AppConfig(**merged)
-            self._write_setting("app_config", self._config.model_dump(mode="json"))
+            payload = self._config.model_dump(mode="json")
+            payload.pop("inference_instances", None)
+            self._write_setting("app_config", payload)
             return self._config.model_copy(deep=True)
 
     @staticmethod

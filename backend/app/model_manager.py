@@ -5,14 +5,15 @@ import io
 import threading
 import time
 import uuid
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 import supervision as sv
 from PIL import Image
 
-from .config import ROOT_DIR, config_store
+from .config import config_store
+from .engines.base import EngineConfig
+from .engines.factory import create_engine
 from .schemas import (
     DetectionItem,
     InferenceInstanceConfig,
@@ -40,20 +41,6 @@ def infer_model_size(path_or_name: str) -> str:
     return "medium"
 
 
-def _import_model_class(size: str):
-    import rfdetr
-
-    class_name = MODEL_CLASS_MAP.get(size, "RFDETRMedium")
-    return getattr(rfdetr, class_name)
-
-
-def _resolve_checkpoint_path(checkpoint: str) -> Path:
-    path = Path(checkpoint)
-    if not path.is_absolute():
-        path = ROOT_DIR / path
-    return path
-
-
 def _resolve_class_names(class_ids: np.ndarray, custom_names: list[str]) -> list[str]:
     if custom_names:
         return [custom_names[cid] if 0 <= cid < len(custom_names) else f"class_{cid}" for cid in class_ids]
@@ -65,19 +52,11 @@ def _resolve_class_names(class_ids: np.ndarray, custom_names: list[str]) -> list
         return [f"class_{cid}" for cid in class_ids]
 
 
-def _primary_device(gpu_ids: list[int]) -> str:
-    if not gpu_ids:
-        import torch
-
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    return f"cuda:{gpu_ids[0]}"
-
-
 class ModelInstance:
     def __init__(self, config: InferenceInstanceConfig) -> None:
         self.config = config
         self._lock = threading.RLock()
-        self._model: Any | None = None
+        self._engine = None
         self._state = ModelState.STOPPED
         self._message = "未启动"
         self._device = ""
@@ -106,7 +85,7 @@ class ModelInstance:
         return self._last_inference_ms
 
     def is_ready(self) -> bool:
-        return self._state == ModelState.READY and self._model is not None
+        return self._state == ModelState.READY and self._engine is not None
 
     def update_config(self, config: InferenceInstanceConfig) -> None:
         with self._lock:
@@ -123,7 +102,21 @@ class ModelInstance:
             device=self._device,
             gpu_ids=list(self.config.gpu_ids),
             checkpoint=self.config.checkpoint,
+            model_type=self.config.model_type,
             last_inference_ms=self._last_inference_ms,
+        )
+
+    def _build_engine_config(self) -> EngineConfig:
+        cfg = self.config
+        return EngineConfig(
+            model_type=cfg.model_type or "rf-detr",
+            size=cfg.size.value if isinstance(cfg.size, ModelSize) else str(cfg.size),
+            checkpoint=cfg.checkpoint,
+            gpu_ids=list(cfg.gpu_ids),
+            confidence=cfg.confidence,
+            resolution=cfg.resolution,
+            optimize_inference=cfg.optimize_inference,
+            class_names=list(cfg.class_names),
         )
 
     def start(self) -> None:
@@ -136,48 +129,25 @@ class ModelInstance:
             self._message = "正在加载模型..."
 
         try:
-            cfg = self.config
-            ModelClass = _import_model_class(cfg.size.value)
-            kwargs: dict[str, Any] = {"device": _primary_device(cfg.gpu_ids)}
-            weights_label = "COCO 预训练"
-            if cfg.checkpoint:
-                checkpoint = _resolve_checkpoint_path(cfg.checkpoint)
-                if not checkpoint.exists():
-                    raise FileNotFoundError(f"权重文件不存在: {checkpoint}")
-                kwargs["pretrain_weights"] = str(checkpoint)
-                try:
-                    weights_label = str(checkpoint.relative_to(ROOT_DIR))
-                except ValueError:
-                    weights_label = str(checkpoint)
-
-            model = ModelClass(**kwargs)
-            if cfg.optimize_inference and hasattr(model, "optimize_for_inference"):
-                try:
-                    model.optimize_for_inference()
-                except Exception:
-                    pass
-
-            if hasattr(model, "model") and hasattr(model.model, "device"):
-                device = str(model.model.device)
-            else:
-                device = _primary_device(cfg.gpu_ids)
-
-            gpu_label = ",".join(str(g) for g in cfg.gpu_ids) if cfg.gpu_ids else "auto"
+            engine = create_engine(self._build_engine_config())
+            engine.load()
             with self._lock:
-                self._model = model
+                self._engine = engine
                 self._state = ModelState.READY
-                self._device = device
-                self._message = f"模型已就绪 ({weights_label}) | GPU [{gpu_label}]"
+                self._device = engine.device
+                self._message = engine.message
         except Exception as exc:
             with self._lock:
-                self._model = None
+                self._engine = None
                 self._state = ModelState.ERROR
                 self._message = f"加载失败: {exc}"
             raise
 
     def stop(self) -> None:
         with self._lock:
-            self._model = None
+            if self._engine:
+                self._engine.unload()
+            self._engine = None
             self._state = ModelState.STOPPED
             self._message = "已停止"
             self._device = ""
@@ -186,9 +156,8 @@ class ModelInstance:
     def warmup(self, repeats: int = 3) -> None:
         if not self.is_ready():
             raise RuntimeError("实例未就绪")
-        dummy = Image.new("RGB", (640, 480), color=(128, 128, 128))
-        for _ in range(repeats):
-            self._predict_internal(dummy)
+        assert self._engine is not None
+        self._engine.warmup(repeats)
 
     def predict_pil(
         self,
@@ -223,7 +192,7 @@ class ModelInstance:
 
         image_b64 = None
         if annotate:
-            annotated = self._annotate(image, detections, items)
+            annotated = self.annotate(image, detections, items)
             image_b64 = _pil_to_base64(annotated)
 
         return InferenceResult(
@@ -255,7 +224,7 @@ class ModelInstance:
                     DetectionItem(class_id=cid, class_name=names[i], confidence=conf, bbox=[x1, y1, x2, y2])
                 )
 
-        annotated = self._annotate(image, detections, items)
+        annotated = self.annotate(image, detections, items)
         annotated_bgr = np.array(annotated)[:, :, ::-1]
         result = InferenceResult(
             detections=items,
@@ -269,15 +238,17 @@ class ModelInstance:
         cfg = self.config
         thr = threshold if threshold is not None else cfg.confidence
         with self._lock:
-            if self._model is None:
+            if self._engine is None:
                 raise RuntimeError("模型未加载")
-            model = self._model
-        predict_kwargs: dict[str, Any] = {"threshold": thr}
-        if cfg.resolution:
-            predict_kwargs["resolution"] = cfg.resolution
-        return model.predict(image, **predict_kwargs)
+            engine = self._engine
+        return engine.predict(image, threshold=thr)
 
-    def _annotate(self, image: Image.Image, detections: sv.Detections | None, items: list[DetectionItem]) -> Image.Image:
+    def annotate(
+        self,
+        image: Image.Image,
+        detections: sv.Detections | None,
+        items: list[DetectionItem],
+    ) -> Image.Image:
         canvas = image.copy()
         if detections is None or len(detections) == 0:
             return canvas
@@ -285,6 +256,10 @@ class ModelInstance:
         canvas = self._box_annotator.annotate(canvas, detections)
         canvas = self._label_annotator.annotate(canvas, detections, labels)
         return canvas
+
+    # 兼容 analysis_worker 对 _annotate 的调用
+    def _annotate(self, image: Image.Image, detections: sv.Detections | None, items: list[DetectionItem]) -> Image.Image:
+        return self.annotate(image, detections, items)
 
 
 class InstanceManager:

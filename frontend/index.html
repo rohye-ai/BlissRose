@@ -120,10 +120,10 @@
                 <button class="btn btn-primary btn-sm" id="btnUploadDataset"><span class="btn-add-icon"></span> 上传 ZIP</button>
               </div>
             </div>
-            <p class="hint">ZIP 需包含 train、valid、test 目录及 data.yaml（YOLO 格式）。</p>
+            <p class="hint">支持 YOLO 标准 ZIP（含 data.yaml），或仅含图片的 ZIP（上传时填写类别名）。标注审核通过后方可用于训练。</p>
             <div class="table-wrap">
               <table class="data-table">
-                <thead><tr><th>名称</th><th>ID</th><th>Train</th><th>Valid</th><th>Test</th><th>上传时间</th><th>上传人员</th><th>类别</th><th class="col-actions">操作</th></tr></thead>
+                <thead><tr><th>名称</th><th>ID</th><th>总数</th><th>已标注</th><th>未标注</th><th>已审核</th><th>审核状态</th><th>上传时间</th><th>上传人员</th><th>类别</th><th class="col-actions">操作</th></tr></thead>
                 <tbody id="datasetTableBody"></tbody>
               </table>
               <div class="table-empty" id="datasetTableEmpty" hidden>暂无数据集</div>
@@ -325,7 +325,7 @@
                 <button class="btn btn-primary btn-sm" id="btnAddTrainJob"><span class="btn-add-icon"></span> 新建任务</button>
               </div>
             </div>
-            <p class="hint">训练完成后点击「部署」将权重自动加入模型列表。运行中的任务可单独停止并查看日志。</p>
+            <p class="hint">中断或失败的任务可点「继续训练」从断点恢复；「重新训练」将忽略断点从头开始。完成后点击「部署」将权重加入模型列表。</p>
             <div class="table-wrap">
               <table class="data-table">
                 <thead><tr><th>名称</th><th>基础模型</th><th>数据集</th><th>状态</th><th>Epochs</th><th>消息</th><th>创建时间</th><th>修改时间</th><th>创建人</th><th>修改人</th><th class="col-actions">操作</th></tr></thead>
@@ -367,6 +367,46 @@
             </div>
             <button class="btn btn-primary" id="btnSaveModelCfg">保存全局默认</button>
           </div>
+
+          <div class="card webhook-config-card">
+            <div class="table-toolbar">
+              <div class="toolbar-left">
+                <h2>报警 Webhook</h2>
+                <span class="hint">持续分析触发报警后，异步推送到钉钉 / 企业微信 / MES 等 HTTP 接口</span>
+              </div>
+              <div class="toolbar-right">
+                <span class="tag" id="whStatusTag">未加载</span>
+              </div>
+            </div>
+            <div class="form-grid">
+              <div class="full">
+                <label class="checkbox-inline">
+                  <input type="checkbox" id="whEnabled" /> 启用 Webhook 推送
+                </label>
+              </div>
+              <div>
+                <label>最低置信度（低于此值不推送）</label>
+                <input type="number" id="whMinConfidence" min="0" max="1" step="0.01" value="0" />
+              </div>
+              <div class="full">
+                <label>限定设备（不选 = 全部设备）</label>
+                <div id="whDeviceChips" class="gpu-chips"></div>
+                <p class="hint">仅对选中设备产生的报警推送 Webhook</p>
+              </div>
+            </div>
+
+            <div class="webhook-channels-header">
+              <h3>推送通道</h3>
+              <button type="button" class="btn btn-secondary btn-sm" id="btnAddWebhookChannel">+ 添加通道</button>
+            </div>
+            <div id="whChannelList" class="webhook-channel-list">
+              <p class="hint">暂无通道，点击「添加通道」配置钉钉 / 企业微信 / 通用 HTTP</p>
+            </div>
+
+            <div class="webhook-actions">
+              <button type="button" class="btn btn-primary" id="btnSaveWebhook">保存 Webhook 配置</button>
+            </div>
+          </div>
         </section>
 
         <!-- API -->
@@ -385,6 +425,9 @@
                 <tr><td>GET</td><td>/api/instances</td><td>推理实例列表</td></tr>
                 <tr><td>POST</td><td>/api/infer/image</td><td>上传推理</td></tr>
                 <tr><td>PUT</td><td>/api/config</td><td>更新配置（SQLite）</td></tr>
+                <tr><td>GET</td><td>/api/platform/webhooks/config</td><td>读取 Webhook 配置</td></tr>
+                <tr><td>PUT</td><td>/api/platform/webhooks/config</td><td>保存 Webhook 配置</td></tr>
+                <tr><td>POST</td><td>/api/platform/webhooks/test</td><td>测试 Webhook 通道</td></tr>
                 <tr><td>WS</td><td>/ws/events?token=</td><td>实时事件推送</td></tr>
               </tbody>
             </table>
@@ -487,38 +530,134 @@
   </div>
 
   <div class="dataset-viewer" id="datasetViewer" hidden>
-    <div class="dataset-viewer-header">
-      <div class="dataset-viewer-title">
-        <strong id="dvDatasetName">数据集</strong>
-        <span id="dvMeta" class="hint"></span>
-      </div>
-      <div class="dataset-viewer-tools">
-        <select id="dvSplitSelect" class="filter-select">
-          <option value="train">train</option>
-          <option value="valid">valid</option>
-          <option value="test">test</option>
-        </select>
-        <label class="dv-toggle-label" id="dvLabelToggleWrap" hidden>
-          <input type="checkbox" id="dvShowLabels" checked /> 展示标注信息
-        </label>
-        <button type="button" class="btn btn-secondary btn-sm" id="dvClose">关闭</button>
-      </div>
-    </div>
-    <div class="dataset-viewer-body">
-      <button type="button" class="dv-nav dv-prev" id="dvPrev" aria-label="上一张">&#10094;</button>
-      <div class="dv-stage">
-        <div class="dv-image-wrap">
-          <img id="dvImage" alt="数据集图片" />
-          <canvas id="dvCanvas"></canvas>
+    <div class="dv-panel">
+      <div class="dataset-viewer-header">
+        <div class="dataset-viewer-title">
+          <h3 id="dvDatasetName">数据集标注</h3>
+          <p class="dv-header-meta">
+            <span id="dvMeta" class="hint"></span>
+            <span id="dvUnsavedBadge" class="dv-unsaved-badge" hidden>未保存</span>
+          </p>
         </div>
-        <p id="dvImageName" class="dv-image-name"></p>
-        <p id="dvNavHint" class="hint">← → 切换图片 · Esc 关闭</p>
+        <button type="button" class="modal-close" id="dvClose" aria-label="关闭">&times;</button>
       </div>
-      <button type="button" class="dv-nav dv-next" id="dvNext" aria-label="下一张">&#10095;</button>
-    </div>
-    <div class="dataset-viewer-labels" id="dvLabelPanel" hidden>
-      <h4>标注明细</h4>
-      <div id="dvLabelList" class="det-list"></div>
+      <div class="dataset-viewer-toolbar">
+        <div class="dv-toolbar-group">
+          <span class="dv-toolbar-label">工具</span>
+          <div class="dv-tool-group">
+            <button type="button" class="btn btn-secondary btn-sm dv-tool-btn" id="dvToolSelect" title="选择 (V)">选择</button>
+            <button type="button" class="btn btn-secondary btn-sm dv-tool-btn active" id="dvToolRect" title="矩形 (R)">矩形</button>
+          </div>
+        </div>
+        <div class="dv-toolbar-group">
+          <span class="dv-toolbar-label">数据集</span>
+          <select id="dvSplitSelect" class="filter-select">
+            <option value="train">train</option>
+            <option value="valid">valid</option>
+            <option value="test">test</option>
+          </select>
+          <select id="dvClassSelect" class="filter-select"></select>
+        </div>
+        <div class="dv-toolbar-group">
+          <span class="dv-toolbar-label">编辑</span>
+          <button type="button" class="btn btn-secondary btn-sm" id="dvUndo" title="撤销 Ctrl+Z">撤销</button>
+          <button type="button" class="btn btn-secondary btn-sm" id="dvRedo" title="重做 Ctrl+Y">重做</button>
+          <button type="button" class="btn btn-secondary btn-sm" id="dvNextUnlabeled" title="下一张未标注 (N)">下一张未标注</button>
+          <button type="button" class="btn btn-secondary btn-sm" id="dvPreAnnotate">AI 标注</button>
+        </div>
+        <div class="dv-toolbar-group dv-toolbar-review">
+          <button type="button" class="btn btn-secondary btn-sm" id="dvSubmitReview">提交审核</button>
+          <button type="button" class="btn btn-primary btn-sm" id="dvApproveReview" hidden>审核通过</button>
+          <button type="button" class="btn btn-danger btn-sm" id="dvRejectReview" hidden>驳回</button>
+        </div>
+      </div>
+      <div class="dataset-annotate-layout">
+        <aside class="dv-sidebar dv-sidebar-left">
+          <div class="dv-sidebar-head">
+            <span id="dvProgressText" class="dv-progress-text">0 / 0</span>
+            <div class="dv-progress-track"><div id="dvProgressBar" class="dv-progress-bar"></div></div>
+            <label for="dvFileSearch">搜索文件</label>
+            <input type="search" id="dvFileSearch" class="dv-file-search" placeholder="输入文件名关键词..." />
+            <label for="dvStatusFilter">标注状态</label>
+            <select id="dvStatusFilter" class="filter-select dv-filter-select">
+              <option value="all">全部</option>
+              <option value="unlabeled">未标注</option>
+              <option value="labeled">已标注</option>
+              <option value="pending">待审核</option>
+              <option value="approved">已通过</option>
+            </select>
+          </div>
+          <div class="dv-file-list-wrap" id="dvFileListWrap">
+            <div id="dvFileList" class="dv-file-list"></div>
+            <div id="dvFileListLoading" class="dv-file-list-loading" hidden>
+              <span class="dv-spinner"></span>
+              <span>加载中...</span>
+            </div>
+          </div>
+          <div class="dv-file-pagination" id="dvFilePagination"></div>
+        </aside>
+        <main class="dv-main">
+          <div class="dv-main-nav">
+            <button type="button" class="dv-nav dv-prev" id="dvPrev" aria-label="上一张">&#10094;</button>
+            <span id="dvImageName" class="dv-image-name"></span>
+            <div class="dv-zoom-controls">
+              <button type="button" class="btn btn-secondary btn-sm" id="dvZoomOut">−</button>
+              <span id="dvZoomLabel" class="dv-zoom-label">100%</span>
+              <button type="button" class="btn btn-secondary btn-sm" id="dvZoomIn">+</button>
+              <button type="button" class="btn btn-secondary btn-sm" id="dvZoomReset">适应</button>
+            </div>
+            <button type="button" class="dv-nav dv-next" id="dvNext" aria-label="下一张">&#10095;</button>
+          </div>
+          <div class="dv-stage">
+            <div class="dv-viewport" id="dvViewport">
+              <div class="dv-transform-layer" id="dvTransformLayer">
+                <div class="dv-image-wrap">
+                  <div class="dv-image-placeholder" id="dvImagePlaceholder">
+                    <svg class="dv-placeholder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                      <rect x="3" y="3" width="18" height="18" rx="2"/>
+                      <circle cx="8.5" cy="8.5" r="1.5"/>
+                      <path d="M21 15l-5-5L5 21"/>
+                    </svg>
+                    <span class="dv-placeholder-text" id="dvPlaceholderText">暂无图片</span>
+                  </div>
+                  <img id="dvImage" alt="数据集图片" decoding="async" hidden />
+                  <canvas id="dvCanvas"></canvas>
+                </div>
+              </div>
+              <div id="dvLoading" class="dv-loading" hidden>
+                <span class="dv-spinner"></span>
+                <span>加载中...</span>
+              </div>
+            </div>
+            <div id="dvImageStatus" class="dv-image-status" hidden></div>
+            <div class="dv-image-review-actions">
+              <button type="button" class="btn btn-primary btn-sm" id="dvImageApprove" hidden>本张通过</button>
+              <button type="button" class="btn btn-danger btn-sm" id="dvImageReject" hidden>本张驳回</button>
+            </div>
+          </div>
+        </main>
+        <aside class="dv-sidebar dv-sidebar-right">
+          <div class="dv-side-block">
+            <div class="dv-side-head">
+              <h4>标注类别</h4>
+              <button type="button" class="btn btn-secondary btn-sm" id="dvAddClass" title="添加类别">+</button>
+            </div>
+            <div id="dvClassList" class="dv-class-list"></div>
+          </div>
+          <div class="dv-side-block">
+            <h4>对象图层</h4>
+            <div id="dvLabelList" class="dv-layer-list"></div>
+          </div>
+          <button type="button" class="btn btn-danger btn-sm dv-clear-btn" id="dvDeleteLabels">清除当前标注</button>
+        </aside>
+      </div>
+      <div class="dataset-viewer-footer">
+        <p id="dvNavHint" class="hint dv-shortcuts">V 选择 · R 矩形 · 1-9 类别 · Alt+拖拽平移 · 滚轮缩放 · Ctrl+Z 撤销 · N 下一张未标注</p>
+        <div class="dv-footer-actions">
+          <button type="button" class="btn btn-secondary btn-sm" id="dvSaveLabels">保存</button>
+          <button type="button" class="btn btn-primary btn-sm" id="dvSaveNext">保存并下一张</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -566,6 +705,7 @@
   </div>
   <script src="/assets/js/icons.js?v=21"></script>
   <script src="/assets/js/app.js?v=22"></script>
-  <script src="/assets/js/app-platform.js?v=22"></script>
+  <script src="/assets/js/app-dataset-viewer.js?v=4"></script>
+  <script src="/assets/js/app-platform.js?v=27"></script>
 </body>
 </html>

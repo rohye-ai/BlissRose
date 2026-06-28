@@ -25,7 +25,8 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum-steps", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--resume-checkpoint", default="")
+    parser.add_argument("--pretrain-weights", default="", help="Initial weights when not resuming")
+    parser.add_argument("--resume", default="", help="PTL checkpoint path to continue training")
     parser.add_argument("--gpu-ids", default="0", help="Comma-separated physical GPU indices, e.g. 0,1")
     args = parser.parse_args()
 
@@ -37,9 +38,13 @@ def main() -> int:
 
     class_name = MODEL_MAP[args.model_size]
     ModelClass = getattr(rfdetr, class_name)
-    kwargs = {}
-    if args.resume_checkpoint:
-        kwargs["pretrain_weights"] = args.resume_checkpoint
+    kwargs: dict = {}
+    resume_path = (args.resume or "").strip()
+    if resume_path:
+        print(f"[RF-DETR] Resuming from checkpoint: {resume_path}")
+    elif args.pretrain_weights:
+        kwargs["pretrain_weights"] = args.pretrain_weights
+        print(f"[RF-DETR] Initial weights: {args.pretrain_weights}")
 
     print(f"[RF-DETR] Loading {class_name} ...")
     print(f"[RF-DETR] Training GPUs (physical): {gpu_ids}")
@@ -54,9 +59,9 @@ def main() -> int:
         "lr": args.lr,
         "output_dir": args.output_dir,
     }
+    if resume_path:
+        train_kwargs["resume"] = resume_path
 
-    # CUDA_VISIBLE_DEVICES is set by TrainingWorker; use devices=int, not device="cuda:N".
-    # Passing device="cuda:0" makes rfdetr emit devices=[0] (a list), which breaks build_trainer.
     train_kwargs["accelerator"] = "gpu"
     if len(gpu_ids) == 1:
         train_kwargs["devices"] = 1
@@ -68,7 +73,7 @@ def main() -> int:
 
     model.train(**train_kwargs)
     print(f"[RF-DETR] Done. Checkpoints saved to {args.output_dir}")
-    print(json.dumps({"gpu_ids": gpu_ids, "devices": len(gpu_ids)}, ensure_ascii=False))
+    print(json.dumps({"gpu_ids": gpu_ids, "devices": len(gpu_ids), "resumed": bool(resume_path)}, ensure_ascii=False))
     return 0
 
 

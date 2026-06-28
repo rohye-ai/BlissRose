@@ -56,12 +56,19 @@ class DeviceType(str, Enum):
     IMAGE = "image"
 
 
+class ModelStage(str, Enum):
+    STAGING = "staging"
+    PRODUCTION = "production"
+    ARCHIVED = "archived"
+
+
 class InferenceInstanceConfig(BaseModel):
     """Single inference instance: own weights, GPUs, and thresholds."""
 
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     name: str = "推理实例"
     enabled: bool = True
+    model_type: str = "rf-detr"
     model_id: str = ""
     device_id: str = ""
     device_ids: list[str] = Field(default_factory=list)
@@ -164,6 +171,7 @@ class InstanceStatus(BaseModel):
     device: str = ""
     gpu_ids: list[int] = Field(default_factory=list)
     checkpoint: str = ""
+    model_type: str = "rf-detr"
     last_inference_ms: float | None = None
 
 
@@ -221,9 +229,32 @@ class ModelRecordOut(BaseModel):
     parent_id: str | None = None
     source: str = "upload"
     version: str = "v1"
+    stage: str = "staging"
+    metrics: dict[str, Any] = Field(default_factory=dict)
     in_use: bool = False
     uploaded_by: str = ""
     created_at: str = ""
+
+
+class BatchInferUrlRequest(BaseModel):
+    urls: list[str] = Field(..., min_length=1, max_length=50)
+    instance_id: str | None = None
+    confidence: float | None = None
+    annotate: bool = True
+
+
+class ModelStageUpdate(BaseModel):
+    stage: ModelStage
+
+
+class ModelEvaluateRequest(BaseModel):
+    dataset_id: str | None = None
+    split: str = "valid"
+
+
+class ModelExportRequest(BaseModel):
+    format: str = "onnx"
+    imgsz: int = Field(640, ge=320, le=1280)
 
 
 class DatasetRecordOut(BaseModel):
@@ -231,12 +262,27 @@ class DatasetRecordOut(BaseModel):
     name: str
     path: str
     data_yaml: str
+    format: str = "yolo"
+    review_status: str = "draft"
+    total_count: int = 0
+    labeled_count: int = 0
+    unlabeled_count: int = 0
+    approved_count: int = 0
+    train_ready: bool = False
     class_names: list[str] = Field(default_factory=list)
     train_count: int = 0
     valid_count: int = 0
     test_count: int = 0
     uploaded_by: str = ""
     created_at: str = ""
+
+
+class DatasetReviewRequest(BaseModel):
+    message: str = ""
+
+
+class DatasetImageReviewRequest(BaseModel):
+    action: str = Field(..., pattern="^(approve|reject)$")
 
 
 class DeviceRecordOut(BaseModel):
@@ -281,7 +327,9 @@ class TrainingJobOut(BaseModel):
     lr: float
     gpu_ids: list[int] = Field(default_factory=list)
     checkpoint_path: str = ""
+    can_resume: bool = False
     deployed_model_id: str | None = None
+    metrics: dict[str, Any] = Field(default_factory=dict)
     message: str = ""
     created_by: str = ""
     updated_by: str = ""
@@ -295,3 +343,39 @@ class AnalysisStatus(BaseModel):
     device_id: str
     running: bool = False
     message: str = ""
+
+
+class YoloAnnotation(BaseModel):
+    class_id: int = Field(0, ge=0)
+    class_name: str = ""
+    cx: float = Field(..., ge=0, le=1)
+    cy: float = Field(..., ge=0, le=1)
+    w: float = Field(..., ge=0, le=1)
+    h: float = Field(..., ge=0, le=1)
+
+
+class SaveLabelsRequest(BaseModel):
+    annotations: list[YoloAnnotation] = Field(default_factory=list)
+    class_names: list[str] | None = None
+
+
+class PreAnnotateRequest(BaseModel):
+    instance_id: str
+    confidence: float | None = None
+    save: bool = False
+
+
+class WebhookChannel(BaseModel):
+    type: str = "generic"  # generic | dingtalk | wecom
+    url: str
+    secret: str = ""
+    enabled: bool = True
+    headers: dict[str, str] = Field(default_factory=dict)
+    timeout: float = 10.0
+
+
+class WebhookConfigUpdate(BaseModel):
+    enabled: bool = False
+    min_confidence: float = Field(0.0, ge=0, le=1)
+    device_ids: list[str] = Field(default_factory=list)
+    channels: list[WebhookChannel] = Field(default_factory=list)

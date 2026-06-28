@@ -1,6 +1,6 @@
 # 智能视觉分析系统
 
-基于 [RF-DETR](https://github.com/roboflow/rf-detr) 构建的 Web 视觉分析平台，集成 **登录与 RBAC 权限**、**多推理实例**、**模型/数据集/设备管理**、**持续分析报警**、**图片/视频推理** 与 **模型训练** 等能力。
+基于 [RF-DETR](https://github.com/roboflow/rf-detr) 以及Yolo构建的 Web 视觉分析平台，集成 **登录与 RBAC 权限**、**多推理实例**、**模型/数据集/设备管理**、**持续分析报警**、**图片/视频推理** 与 **模型训练** 等能力。
 
 RF-DETR 采用 Transformer 端到端检测架构，相比传统 Anchor + NMS 方案：
 
@@ -42,7 +42,7 @@ RF-DETR 采用 Transformer 端到端检测架构，相比传统 Anchor + NMS 方
 ## 快速开始
 
 ```bash
-cd rf-detr-platform
+cd BlissRose
 
 # 创建虚拟环境（推荐）
 python -m venv .venv
@@ -232,5 +232,6 @@ rf-detr-platform/
 
 ## 参考
 
+- [平台架构设计（v2.0）](docs/ARCHITECTURE.md)
 - [RF-DETR GitHub](https://github.com/roboflow/rf-detr)
 - [RF-DETR vs YOLO 架构对比](https://www.exxactcorp.com/blog/deep-learning/rf-detr-vs-yolo-transformers-in-computer-vision)

@@ -113,17 +113,45 @@ function refreshModelSelects() {
   });
 }
 
-function refreshDatasetSelects() {
-  const opts = platformState.datasets.map((d) =>
-    `<option value="${d.id}">${platformEsc(d.name)} (train:${d.train_count})</option>`
+function refreshDatasetSelects(extraDatasetId = null) {
+  let ready = platformState.datasets.filter((d) => d.train_ready);
+  if (extraDatasetId && !ready.some((d) => d.id === extraDatasetId)) {
+    const extra = platformState.datasets.find((d) => d.id === extraDatasetId);
+    if (extra) ready = [extra, ...ready];
+  }
+  const opts = ready.map((d) =>
+    `<option value="${d.id}">${platformEsc(d.name)} (${d.total_count || d.train_count} 张)</option>`
   ).join("");
   ["modalTrainDatasetSelect"].forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
     const prev = el.value;
-    el.innerHTML = `<option value="">— 选择数据集 —</option>${opts}`;
-    if (prev) el.value = prev;
+    const hint = ready.length ? "" : "（暂无已审核通过的数据集）";
+    el.innerHTML = `<option value="">— 选择数据集 —${hint}</option>${opts}`;
+    if (prev && ready.some((d) => d.id === prev)) el.value = prev;
   });
+}
+
+function reviewStatusLabel(status) {
+  return {
+    draft: "草稿",
+    annotating: "标注中",
+    pending_review: "待审核",
+    approved: "已通过",
+    rejected: "已驳回",
+  }[status] || status || "—";
+}
+
+function reviewStatusBadge(status) {
+  const cls = `review-badge-${(status || "draft").replace(/[^a-z_]/g, "")}`;
+  return `<span class="tag ${cls}">${reviewStatusLabel(status)}</span>`;
+}
+
+function annotateStatusClass(status) {
+  if (status === "approved") return "dv-status-approved";
+  if (status === "labeled") return "dv-status-labeled";
+  if (status === "rejected") return "dv-status-rejected";
+  return "dv-status-unlabeled";
 }
 
 function refreshDeviceSelects() {
@@ -216,15 +244,17 @@ function renderDatasetTable() {
   tbody.innerHTML = pag.slice.map((d) => `<tr>
     <td><strong>${platformEsc(d.name)}</strong></td>
     <td class="cell-muted">${platformEsc(d.id)}</td>
-    <td>${d.train_count}</td>
-    <td>${d.valid_count}</td>
-    <td>${d.test_count}</td>
+    <td>${d.total_count ?? d.train_count ?? 0}</td>
+    <td>${d.labeled_count ?? 0}</td>
+    <td>${d.unlabeled_count ?? 0}</td>
+    <td>${d.approved_count ?? 0}</td>
+    <td>${reviewStatusBadge(d.review_status)}${d.train_ready ? ' <span class="tag tag-info">可训练</span>' : ""}</td>
     <td class="cell-muted">${formatUploadTime(d.created_at)}</td>
     <td>${platformEsc(d.uploaded_by) || "—"}</td>
     <td>${(d.class_names || []).map(platformEsc).join(", ") || "—"}</td>
     <td class="col-actions">
       <div class="action-group">
-        <button class="btn btn-primary btn-sm" data-ds-action="browse" data-id="${d.id}">浏览</button>
+        <button class="btn btn-primary btn-sm" data-ds-action="annotate" data-id="${d.id}">标注</button>
         <button class="btn btn-danger btn-sm" data-ds-action="delete" data-id="${d.id}">删除</button>
       </div>
     </td>
@@ -232,7 +262,7 @@ function renderDatasetTable() {
   tbody.querySelectorAll("[data-ds-action]").forEach((btn) => {
     btn.onclick = async () => {
       const id = btn.dataset.id;
-      if (btn.dataset.dsAction === "browse") {
+      if (btn.dataset.dsAction === "annotate") {
         const ds = platformState.datasets.find((d) => d.id === id);
         openDatasetViewer(id, ds?.name || id);
       } else {
@@ -246,236 +276,6 @@ function renderDatasetTable() {
     };
   });
   renderTablePagination("#datasetPagination", pag, "dataset", renderDatasetTable);
-}
-
-const datasetViewerState = {
-  datasetId: null,
-  datasetName: "",
-  split: "train",
-  images: [],
-  index: 0,
-  showLabels: true,
-  annotations: [],
-  classNames: [],
-  loading: false,
-};
-
-const DV_LABEL_COLORS = ["#22c55e", "#3b82f6", "#f59e0b", "#ef4444", "#a855f7", "#06b6d4"];
-
-function datasetPreviewUrl(datasetId, itemPath) {
-  if (!datasetId || !itemPath) return "";
-  const base = `/api/platform/datasets/${datasetId}/file?path=${encodeURIComponent(itemPath)}`;
-  return authUrl(base);
-}
-
-async function openDatasetViewer(datasetId, datasetName = "") {
-  datasetViewerState.datasetId = datasetId;
-  datasetViewerState.datasetName = datasetName;
-  datasetViewerState.split = "train";
-  datasetViewerState.index = 0;
-  datasetViewerState.showLabels = true;
-  const viewer = document.getElementById("datasetViewer");
-  const splitSel = document.getElementById("dvSplitSelect");
-  const showLabelsEl = document.getElementById("dvShowLabels");
-  if (splitSel) splitSel.value = "train";
-  if (showLabelsEl) showLabelsEl.checked = true;
-  if (viewer) viewer.hidden = false;
-  document.body.style.overflow = "hidden";
-  await loadDatasetViewerImages();
-}
-
-function closeDatasetViewer() {
-  const viewer = document.getElementById("datasetViewer");
-  if (viewer) viewer.hidden = true;
-  document.body.style.overflow = "";
-  datasetViewerState.images = [];
-  datasetViewerState.annotations = [];
-}
-
-async function loadDatasetViewerImages() {
-  const { datasetId, split } = datasetViewerState;
-  if (!datasetId) return;
-  datasetViewerState.loading = true;
-  const meta = document.getElementById("dvMeta");
-  if (meta) meta.textContent = "加载中...";
-  try {
-    const data = await api(`/api/platform/datasets/${datasetId}/images?split=${split}`);
-    datasetViewerState.images = data.items || [];
-    datasetViewerState.datasetName = data.dataset_name || datasetViewerState.datasetName;
-    datasetViewerState.classNames = data.class_names || [];
-    datasetViewerState.index = Math.min(datasetViewerState.index, Math.max(0, datasetViewerState.images.length - 1));
-    const nameEl = document.getElementById("dvDatasetName");
-    if (nameEl) nameEl.textContent = datasetViewerState.datasetName || "数据集浏览";
-    if (meta) {
-      meta.textContent = `${split} · 共 ${data.total} 张 · 已标注 ${data.labeled_count || 0} 张`;
-    }
-    if (datasetViewerState.images.length === 0) {
-      document.getElementById("dvImage").removeAttribute("src");
-      document.getElementById("dvImageName").textContent = "该划分下暂无图片";
-      updateDatasetViewerNav();
-      return;
-    }
-    await showDatasetViewerImage(datasetViewerState.index);
-  } catch (e) {
-    toast(e.message, true);
-    closeDatasetViewer();
-  } finally {
-    datasetViewerState.loading = false;
-  }
-}
-
-async function showDatasetViewerImage(index) {
-  const images = datasetViewerState.images;
-  if (!images.length || index < 0 || index >= images.length) return;
-  datasetViewerState.index = index;
-  const item = images[index];
-  const imgEl = document.getElementById("dvImage");
-  const nameEl = document.getElementById("dvImageName");
-  const toggleWrap = document.getElementById("dvLabelToggleWrap");
-  const labelPanel = document.getElementById("dvLabelPanel");
-  const labelList = document.getElementById("dvLabelList");
-  const src = datasetPreviewUrl(datasetViewerState.datasetId, item.path);
-
-  updateDatasetViewerNav();
-
-  if (nameEl) {
-    nameEl.textContent = `${index + 1} / ${images.length} · ${item.name}${item.has_labels ? " · 已标注" : ""}`;
-  }
-
-  datasetViewerState.annotations = [];
-  if (item.has_labels) {
-    try {
-      const labelData = await api(
-        `/api/platform/datasets/${datasetViewerState.datasetId}/labels?path=${encodeURIComponent(item.path)}`
-      );
-      datasetViewerState.annotations = labelData.annotations || [];
-    } catch (_) {
-      datasetViewerState.annotations = [];
-    }
-  }
-
-  const hasAnns = datasetViewerState.annotations.length > 0;
-  if (toggleWrap) toggleWrap.hidden = !hasAnns;
-  if (!hasAnns) {
-    if (labelPanel) labelPanel.hidden = true;
-    if (labelList) labelList.innerHTML = '<p class="hint">当前图片无标注文件</p>';
-  }
-
-  if (imgEl) {
-    imgEl.onload = () => {
-      renderDatasetViewerOverlay();
-      renderDatasetViewerLabelList();
-    };
-    imgEl.src = src;
-  }
-}
-
-function updateDatasetViewerNav() {
-  const { images, index } = datasetViewerState;
-  const prev = document.getElementById("dvPrev");
-  const next = document.getElementById("dvNext");
-  if (prev) prev.disabled = index <= 0;
-  if (next) next.disabled = !images.length || index >= images.length - 1;
-}
-
-function renderDatasetViewerOverlay() {
-  const canvas = document.getElementById("dvCanvas");
-  const img = document.getElementById("dvImage");
-  if (!canvas || !img || !img.complete || !img.naturalWidth) return;
-
-  const show = datasetViewerState.showLabels && datasetViewerState.annotations.length > 0;
-  const wrap = img.parentElement;
-  const displayW = img.clientWidth;
-  const displayH = img.clientHeight;
-  if (!displayW || !displayH) return;
-
-  canvas.width = displayW;
-  canvas.height = displayH;
-  canvas.style.width = `${displayW}px`;
-  canvas.style.height = `${displayH}px`;
-
-  const ctx = canvas.getContext("2d");
-  ctx.clearRect(0, 0, displayW, displayH);
-  if (!show) return;
-
-  const sx = displayW / img.naturalWidth;
-  const sy = displayH / img.naturalHeight;
-
-  datasetViewerState.annotations.forEach((ann) => {
-    const cx = ann.cx * displayW;
-    const cy = ann.cy * displayH;
-    const bw = ann.w * displayW;
-    const bh = ann.h * displayH;
-    const x = cx - bw / 2;
-    const y = cy - bh / 2;
-    const color = DV_LABEL_COLORS[ann.class_id % DV_LABEL_COLORS.length];
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.strokeRect(x, y, bw, bh);
-    ctx.fillStyle = color;
-    ctx.font = "12px sans-serif";
-    const label = `${ann.class_name}`;
-    const tw = ctx.measureText(label).width + 8;
-    ctx.fillRect(x, Math.max(0, y - 18), tw, 18);
-    ctx.fillStyle = "#fff";
-    ctx.fillText(label, x + 4, Math.max(12, y - 5));
-  });
-}
-
-function renderDatasetViewerLabelList() {
-  const panel = document.getElementById("dvLabelPanel");
-  const list = document.getElementById("dvLabelList");
-  const show = datasetViewerState.showLabels && datasetViewerState.annotations.length > 0;
-  if (!list) return;
-  if (!show) {
-    if (panel) panel.hidden = true;
-    return;
-  }
-  if (panel) panel.hidden = false;
-  list.innerHTML = datasetViewerState.annotations.map((ann) => {
-    const x1 = ((ann.cx - ann.w / 2) * 100).toFixed(1);
-    const y1 = ((ann.cy - ann.h / 2) * 100).toFixed(1);
-    const x2 = ((ann.cx + ann.w / 2) * 100).toFixed(1);
-    const y2 = ((ann.cy + ann.h / 2) * 100).toFixed(1);
-    return `<div class="det-item">
-      <span><strong>${platformEsc(ann.class_name)}</strong> #${ann.class_id}</span>
-      <span>YOLO: cx=${ann.cx.toFixed(4)} cy=${ann.cy.toFixed(4)} w=${ann.w.toFixed(4)} h=${ann.h.toFixed(4)}</span>
-      <span style="grid-column:1/-1;color:var(--muted)">bbox %(≈): [${x1}, ${y1}, ${x2}, ${y2}]</span>
-    </div>`;
-  }).join("");
-}
-
-function datasetViewerStep(delta) {
-  if (datasetViewerState.loading) return;
-  const next = datasetViewerState.index + delta;
-  if (next < 0 || next >= datasetViewerState.images.length) return;
-  showDatasetViewerImage(next);
-}
-
-function initDatasetViewer() {
-  document.getElementById("dvClose")?.addEventListener("click", closeDatasetViewer);
-  document.getElementById("dvPrev")?.addEventListener("click", () => datasetViewerStep(-1));
-  document.getElementById("dvNext")?.addEventListener("click", () => datasetViewerStep(1));
-  document.getElementById("dvSplitSelect")?.addEventListener("change", async (e) => {
-    datasetViewerState.split = e.target.value;
-    datasetViewerState.index = 0;
-    await loadDatasetViewerImages();
-  });
-  document.getElementById("dvShowLabels")?.addEventListener("change", (e) => {
-    datasetViewerState.showLabels = e.target.checked;
-    renderDatasetViewerOverlay();
-    renderDatasetViewerLabelList();
-  });
-  window.addEventListener("resize", () => {
-    if (!document.getElementById("datasetViewer")?.hidden) renderDatasetViewerOverlay();
-  });
-  document.addEventListener("keydown", (e) => {
-    const viewer = document.getElementById("datasetViewer");
-    if (viewer?.hidden) return;
-    if (e.key === "Escape") closeDatasetViewer();
-    else if (e.key === "ArrowLeft") { e.preventDefault(); datasetViewerStep(-1); }
-    else if (e.key === "ArrowRight") { e.preventDefault(); datasetViewerStep(1); }
-  });
 }
 
 function renderDeviceTable() {
@@ -591,7 +391,11 @@ function renderTrainingJobTable() {
     ${renderAuditCells(j, platformEsc)}
     <td class="col-actions">
       <div class="action-group">
-        ${j.state === "pending" || j.state === "failed" ? `<button class="btn btn-primary btn-sm" data-job-action="start" data-id="${j.id}">训练</button>` : ""}
+        ${["pending", "failed", "queued"].includes(j.state) ? `<button class="btn btn-secondary btn-sm" data-job-action="edit" data-id="${j.id}">编辑</button>` : ""}
+        ${(j.state === "pending" || j.state === "failed") && j.can_resume ? `<button class="btn btn-primary btn-sm" data-job-action="resume" data-id="${j.id}">继续训练</button>` : ""}
+        ${(j.state === "pending" || j.state === "failed") && !j.can_resume ? `<button class="btn btn-primary btn-sm" data-job-action="start" data-id="${j.id}">训练</button>` : ""}
+        ${(j.state === "pending" || j.state === "failed") && j.can_resume ? `<button class="btn btn-secondary btn-sm" data-job-action="restart" data-id="${j.id}">重新训练</button>` : ""}
+        ${j.state === "queued" ? `<span class="tag">排队中</span>` : ""}
         ${j.state === "running" ? `<button class="btn btn-danger btn-sm" data-job-action="stop" data-id="${j.id}">停止</button>` : ""}
         <button class="btn btn-secondary btn-sm" data-job-action="log" data-id="${j.id}">日志</button>
         ${j.state === "completed" && !j.deployed_model_id ? `<button class="btn btn-primary btn-sm" data-job-action="deploy" data-id="${j.id}">部署</button>` : ""}
@@ -603,11 +407,14 @@ function renderTrainingJobTable() {
     btn.onclick = async () => {
       const id = btn.dataset.id;
       try {
-        if (btn.dataset.jobAction === "start") {
-          const r = await api("/api/train/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ job_id: id }) });
-          toast(r.message);
-          refreshStatus();
-          loadTrainingJobs();
+        if (btn.dataset.jobAction === "resume") {
+          await startTrainingJob(id, true);
+        } else if (btn.dataset.jobAction === "start") {
+          await startTrainingJob(id, true);
+        } else if (btn.dataset.jobAction === "restart") {
+          confirmRestartTrainingJob(id);
+        } else if (btn.dataset.jobAction === "edit") {
+          openTrainJobModal(id);
         } else if (btn.dataset.jobAction === "stop") {
           const r = await api(`/api/platform/training-jobs/${id}/stop`, { method: "POST" });
           toast(r.message);
@@ -675,9 +482,10 @@ function openUploadDatasetModal() {
     title: "上传数据集 (ZIP)",
     confirmText: "上传",
     bodyHtml: `
-      <p class="hint">ZIP 内需包含 train、valid、test 文件夹及 data.yaml</p>
+      <p class="hint">支持两种格式：<br>1. YOLO 标准 ZIP（含 train/valid/test 与 data.yaml）<br>2. 仅图片 ZIP（无标注，上传后在线标注；请填写类别名，逗号分隔）</p>
       <div class="form-grid">
         <div class="full"><label>数据集名称</label><input type="text" id="uploadDatasetName" placeholder="smoke_fire" /></div>
+        <div class="full"><label>类别名（纯图片 ZIP 必填）</label><input type="text" id="uploadDatasetClasses" placeholder="人, 车, 火" /></div>
         <div class="full"><label>ZIP 文件</label><input type="file" id="uploadDatasetFile" accept=".zip" /></div>
       </div>`,
     onConfirm: async () => {
@@ -689,6 +497,7 @@ function openUploadDatasetModal() {
         const fd = new FormData();
         fd.append("file", file);
         fd.append("name", document.getElementById("uploadDatasetName").value.trim());
+        fd.append("class_names", document.getElementById("uploadDatasetClasses").value.trim());
         const res = await fetch("/api/platform/datasets/upload", { method: "POST", headers: authHeaders(), body: fd });
         if (res.status === 401) {
           setModalBusy(false);
@@ -1034,6 +843,22 @@ function initRoiEditor() {
   });
 }
 
+async function startTrainingJob(jobId, resume = true) {
+  const r = await api("/api/train/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ job_id: jobId, resume }),
+  });
+  toast(r.message || (resume ? "训练已启动" : "已从头开始训练"));
+  refreshStatus();
+  loadTrainingJobs();
+}
+
+function confirmRestartTrainingJob(jobId) {
+  if (!confirm("将忽略已有断点，从基础模型权重重新开始训练。确定继续？")) return;
+  startTrainingJob(jobId, false);
+}
+
 async function createTrainingJobFromPanel() {
   const modelId = document.getElementById("modalTrainModelSelect")?.value;
   const datasetId = document.getElementById("modalTrainDatasetSelect")?.value;
@@ -1050,38 +875,75 @@ async function createTrainingJobFromPanel() {
       grad_accum_steps: Number(document.getElementById("modalTrainGradInput")?.value || 4),
       lr: Number(document.getElementById("modalTrainLrInput")?.value || 0.0001),
       gpu_ids: [...selectedTrainGpus].sort((a, b) => a - b),
+      auto_start: false,
     }),
   });
   toast("训练任务已创建");
   loadTrainingJobs();
 }
 
-function openCreateTrainJobModal() {
+async function updateTrainingJobFromPanel(jobId) {
+  const modelId = document.getElementById("modalTrainModelSelect")?.value;
+  const datasetId = document.getElementById("modalTrainDatasetSelect")?.value;
+  if (!modelId || !datasetId) throw new Error("请选择模型和数据集");
+  await api(`/api/platform/training-jobs/${jobId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: document.getElementById("modalTrainJobName")?.value.trim() || undefined,
+      model_id: modelId,
+      dataset_id: datasetId,
+      epochs: Number(document.getElementById("modalTrainEpochsInput")?.value || 50),
+      batch_size: Number(document.getElementById("modalTrainBatchInput")?.value || 4),
+      grad_accum_steps: Number(document.getElementById("modalTrainGradInput")?.value || 4),
+      lr: Number(document.getElementById("modalTrainLrInput")?.value || 0.0001),
+      gpu_ids: [...selectedTrainGpus].sort((a, b) => a - b),
+    }),
+  });
+  toast("训练任务已更新");
+  loadTrainingJobs();
+}
+
+function openTrainJobModal(jobId = null) {
+  const job = jobId ? platformState.trainingJobs.find((j) => j.id === jobId) : null;
+  const isEdit = !!job;
+  if (isEdit && !["pending", "failed", "queued"].includes(job.state)) {
+    toast("仅待训练、排队中或失败状态的任务可修改", true);
+    return;
+  }
   const cfg = lastStatus?.config?.training || {};
-  selectedTrainGpus = new Set(cfg.gpu_ids || [0]);
+  selectedTrainGpus = new Set(isEdit ? (job.gpu_ids || [0]) : (cfg.gpu_ids || [0]));
   openModal({
-    title: "新建训练任务",
+    title: isEdit ? "编辑训练任务" : "新建训练任务",
     wide: true,
-    confirmText: "创建",
+    confirmText: isEdit ? "保存" : "创建",
     bodyHtml: `
       <div class="form-grid">
-        <div class="full"><label>任务名称（可选）</label><input type="text" id="modalTrainJobName" placeholder="smoke-v2" /></div>
+        <div class="full"><label>任务名称</label><input type="text" id="modalTrainJobName" value="${platformEsc(job?.name || "")}" placeholder="smoke-v2" /></div>
         <div class="full"><label>基础模型</label><select id="modalTrainModelSelect"><option value="">— 选择模型 —</option></select></div>
         <div class="full"><label>数据集</label><select id="modalTrainDatasetSelect"><option value="">— 选择数据集 —</option></select></div>
+        <p class="hint full">仅显示标注审核通过的数据集${isEdit && (job?.state === "failed" || job?.state === "queued") ? "；保存后任务将重置为待训练" : ""}</p>
         <div class="full"><label>训练 GPU（多选 = 多卡 DDP）</label><div id="modalTrainGpuChips" class="gpu-chips"></div></div>
         <p class="hint full" id="modalTrainGpuHint">已选 1 张卡：单卡训练</p>
-        <div><label>Epochs</label><input type="number" id="modalTrainEpochsInput" min="1" value="${cfg.epochs || 50}" /></div>
-        <div><label>Batch Size</label><input type="number" id="modalTrainBatchInput" min="1" value="${cfg.batch_size || 4}" /></div>
-        <div><label>Grad Accum</label><input type="number" id="modalTrainGradInput" min="1" value="${cfg.grad_accum_steps || 4}" /></div>
-        <div><label>Learning Rate</label><input type="number" id="modalTrainLrInput" step="0.00001" value="${cfg.lr || 0.0001}" /></div>
+        <div><label>Epochs</label><input type="number" id="modalTrainEpochsInput" min="1" value="${job?.epochs ?? cfg.epochs ?? 50}" /></div>
+        <div><label>Batch Size</label><input type="number" id="modalTrainBatchInput" min="1" value="${job?.batch_size ?? cfg.batch_size ?? 4}" /></div>
+        <div><label>Grad Accum</label><input type="number" id="modalTrainGradInput" min="1" value="${job?.grad_accum_steps ?? cfg.grad_accum_steps ?? 4}" /></div>
+        <div><label>Learning Rate</label><input type="number" id="modalTrainLrInput" step="0.00001" value="${job?.lr ?? cfg.lr ?? 0.0001}" /></div>
       </div>`,
     onConfirm: async () => {
-      await createTrainingJobFromPanel();
+      if (isEdit) await updateTrainingJobFromPanel(jobId);
+      else await createTrainingJobFromPanel();
       closeModal();
     },
   });
   refreshModelSelects();
-  refreshDatasetSelects();
+  refreshDatasetSelects(isEdit ? job.dataset_id : null);
+  if (isEdit) {
+    const modelSel = document.getElementById("modalTrainModelSelect");
+    const datasetSel = document.getElementById("modalTrainDatasetSelect");
+    if (modelSel) modelSel.value = job.model_id;
+    if (datasetSel) datasetSel.value = job.dataset_id;
+  }
   buildGpuChips($("#modalTrainGpuChips"), cachedGpus, selectedTrainGpus, () => {
     const hint = $("#modalTrainGpuHint");
     const n = selectedTrainGpus.size;
@@ -1091,6 +953,10 @@ function openCreateTrainJobModal() {
         : `已选 ${n} 张卡：多卡 DDP 训练（物理 GPU ${[...selectedTrainGpus].sort((a, b) => a - b).join(", ")}）`;
     }
   });
+}
+
+function openCreateTrainJobModal() {
+  openTrainJobModal();
 }
 
 let trainLogPollTimer = null;
@@ -1167,13 +1033,287 @@ function initPlatformPanels() {
   document.getElementById("btnRefreshAlerts")?.addEventListener("click", () => loadPlatformAlerts(1));
   initDatasetViewer();
   initRoiEditor();
+  initWebhookConfigPanel();
 }
 
 async function refreshPlatformData(tabKey) {
   if (tabKey === "models" || tabKey === "gpu" || tabKey === "train") await loadPlatformModels();
   if (tabKey === "datasets" || tabKey === "train") await loadPlatformDatasets();
-  if (tabKey === "devices" || tabKey === "gpu") await loadPlatformDevices();
+  if (tabKey === "devices" || tabKey === "gpu" || tabKey === "settings") await loadPlatformDevices();
   if (tabKey === "alerts") await loadPlatformAlerts();
   if (tabKey === "train") await loadTrainingJobs();
   if (tabKey === "gpu") await loadAnalysisStatus();
+  if (tabKey === "settings") await loadWebhookConfig();
+}
+
+/** ---- Webhook 配置 ---- */
+const webhookConfigState = {
+  enabled: false,
+  min_confidence: 0,
+  device_ids: [],
+  channels: [],
+};
+
+const WEBHOOK_TYPE_LABELS = {
+  generic: "通用 HTTP / MES",
+  dingtalk: "钉钉机器人",
+  wecom: "企业微信群机器人",
+};
+
+function defaultWebhookChannel() {
+  return {
+    type: "dingtalk",
+    url: "",
+    secret: "",
+    enabled: true,
+    headers: {},
+    timeout: 10,
+  };
+}
+
+function renderWebhookDeviceChips() {
+  const wrap = document.getElementById("whDeviceChips");
+  if (!wrap) return;
+  const selected = new Set(webhookConfigState.device_ids || []);
+  const devices = platformState.devices || [];
+  if (!devices.length) {
+    wrap.innerHTML = '<span class="hint">暂无设备，请先在「设备管理」中添加</span>';
+    return;
+  }
+  wrap.innerHTML = devices.map((d) => {
+    const on = selected.has(d.id) ? " selected" : "";
+    return `<label class="gpu-chip${on}">
+      <input type="checkbox" value="${platformEsc(d.id)}" ${on ? "checked" : ""} />
+      ${platformEsc(d.name)}
+    </label>`;
+  }).join("");
+  wrap.querySelectorAll("input[type=checkbox]").forEach((cb) => {
+    cb.addEventListener("change", () => {
+      const id = cb.value;
+      const set = new Set(webhookConfigState.device_ids || []);
+      if (cb.checked) set.add(id);
+      else set.delete(id);
+      webhookConfigState.device_ids = [...set];
+      cb.closest(".gpu-chip")?.classList.toggle("selected", cb.checked);
+    });
+  });
+}
+
+function renderWebhookChannels() {
+  const list = document.getElementById("whChannelList");
+  if (!list) return;
+  const channels = webhookConfigState.channels || [];
+  if (!channels.length) {
+    list.innerHTML = '<p class="hint">暂无通道，点击「添加通道」配置钉钉 / 企业微信 / 通用 HTTP</p>';
+    return;
+  }
+  list.innerHTML = channels.map((ch, idx) => {
+    const headersText = ch.headers && Object.keys(ch.headers).length
+      ? JSON.stringify(ch.headers, null, 2)
+      : "";
+    const showSecret = ch.type === "dingtalk";
+    const showHeaders = ch.type === "generic";
+    return `<div class="webhook-channel-item" data-idx="${idx}">
+      <div class="webhook-channel-head">
+        <strong>通道 ${idx + 1}</strong>
+        <div class="action-group">
+          <button type="button" class="btn btn-secondary btn-sm" data-wh-test="${idx}">测试</button>
+          <button type="button" class="btn btn-danger btn-sm" data-wh-del="${idx}">删除</button>
+        </div>
+      </div>
+      <div class="form-grid">
+        <div>
+          <label>类型</label>
+          <select data-wh-field="type" data-idx="${idx}">
+            ${Object.entries(WEBHOOK_TYPE_LABELS).map(([v, l]) =>
+              `<option value="${v}" ${ch.type === v ? "selected" : ""}>${l}</option>`
+            ).join("")}
+          </select>
+        </div>
+        <div>
+          <label><input type="checkbox" data-wh-field="enabled" data-idx="${idx}" ${ch.enabled !== false ? "checked" : ""} /> 启用</label>
+        </div>
+        <div class="full">
+          <label>Webhook URL</label>
+          <input type="text" data-wh-field="url" data-idx="${idx}" value="${platformEsc(ch.url || "")}" placeholder="https://..." />
+        </div>
+        <div class="full wh-secret-row" data-idx="${idx}" ${showSecret ? "" : "hidden"}>
+          <label>钉钉加签 Secret（可选）</label>
+          <input type="text" data-wh-field="secret" data-idx="${idx}" value="${platformEsc(ch.secret || "")}" placeholder="SEC..." />
+        </div>
+        <div class="full wh-headers-row" data-idx="${idx}" ${showHeaders ? "" : "hidden"}>
+          <label>自定义 Headers（JSON）</label>
+          <textarea data-wh-field="headers" data-idx="${idx}" rows="3" placeholder='{"X-Api-Key": "your-key"}'>${platformEsc(headersText)}</textarea>
+        </div>
+      </div>
+    </div>`;
+  }).join("");
+
+  list.querySelectorAll("[data-wh-field]").forEach((el) => {
+    el.addEventListener("change", () => syncWebhookChannelFromDom(Number(el.dataset.idx)));
+    el.addEventListener("input", () => syncWebhookChannelFromDom(Number(el.dataset.idx)));
+  });
+  list.querySelectorAll('select[data-wh-field="type"]').forEach((sel) => {
+    sel.addEventListener("change", () => {
+      const idx = Number(sel.dataset.idx);
+      syncWebhookChannelFromDom(idx);
+      const item = list.querySelector(`.webhook-channel-item[data-idx="${idx}"]`);
+      const type = webhookConfigState.channels[idx]?.type;
+      item?.querySelector(`.wh-secret-row[data-idx="${idx}"]`)?.toggleAttribute("hidden", type !== "dingtalk");
+      item?.querySelector(`.wh-headers-row[data-idx="${idx}"]`)?.toggleAttribute("hidden", type !== "generic");
+    });
+  });
+  list.querySelectorAll("[data-wh-test]").forEach((btn) => {
+    btn.addEventListener("click", () => testWebhookChannel(Number(btn.dataset.whTest)));
+  });
+  list.querySelectorAll("[data-wh-del]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      webhookConfigState.channels.splice(Number(btn.dataset.whDel), 1);
+      renderWebhookChannels();
+      updateWebhookStatusTag();
+    });
+  });
+}
+
+function syncWebhookChannelFromDom(idx) {
+  const ch = webhookConfigState.channels[idx];
+  if (!ch) return;
+  const root = document.getElementById("whChannelList");
+  const item = root?.querySelector(`.webhook-channel-item[data-idx="${idx}"]`);
+  if (!item) return;
+  ch.type = item.querySelector('[data-wh-field="type"]')?.value || "generic";
+  ch.enabled = item.querySelector('[data-wh-field="enabled"]')?.checked !== false;
+  ch.url = item.querySelector('[data-wh-field="url"]')?.value.trim() || "";
+  ch.secret = item.querySelector('[data-wh-field="secret"]')?.value.trim() || "";
+  const headersRaw = item.querySelector('[data-wh-field="headers"]')?.value.trim() || "";
+  if (headersRaw) {
+    try {
+      ch.headers = JSON.parse(headersRaw);
+    } catch (_) {
+      /* 保留上次有效值 */
+    }
+  } else {
+    ch.headers = {};
+  }
+}
+
+function syncWebhookGlobalFromDom() {
+  webhookConfigState.enabled = document.getElementById("whEnabled")?.checked || false;
+  webhookConfigState.min_confidence = Number(document.getElementById("whMinConfidence")?.value || 0);
+}
+
+function updateWebhookStatusTag() {
+  const tag = document.getElementById("whStatusTag");
+  if (!tag) return;
+  const n = (webhookConfigState.channels || []).filter((c) => c.enabled !== false && c.url).length;
+  if (webhookConfigState.enabled && n > 0) {
+    tag.textContent = `已启用 · ${n} 个通道`;
+    tag.className = "tag tag-ok";
+  } else if (n > 0) {
+    tag.textContent = `已配置 ${n} 个通道（总开关关闭）`;
+    tag.className = "tag";
+  } else {
+    tag.textContent = "未配置";
+    tag.className = "tag";
+  }
+}
+
+function fillWebhookForm(cfg) {
+  webhookConfigState.enabled = !!cfg.enabled;
+  webhookConfigState.min_confidence = cfg.min_confidence ?? 0;
+  webhookConfigState.device_ids = [...(cfg.device_ids || [])];
+  webhookConfigState.channels = (cfg.channels || []).map((c) => ({
+    type: c.type || "generic",
+    url: c.url || "",
+    secret: c.secret || "",
+    enabled: c.enabled !== false,
+    headers: c.headers || {},
+    timeout: c.timeout || 10,
+  }));
+  const whEnabled = document.getElementById("whEnabled");
+  const whMin = document.getElementById("whMinConfidence");
+  if (whEnabled) whEnabled.checked = webhookConfigState.enabled;
+  if (whMin) whMin.value = webhookConfigState.min_confidence;
+  renderWebhookDeviceChips();
+  renderWebhookChannels();
+  updateWebhookStatusTag();
+}
+
+async function loadWebhookConfig() {
+  try {
+    const cfg = await api("/api/platform/webhooks/config");
+    fillWebhookForm(cfg);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function collectWebhookPayload() {
+  (webhookConfigState.channels || []).forEach((_, idx) => syncWebhookChannelFromDom(idx));
+  syncWebhookGlobalFromDom();
+  return {
+    enabled: webhookConfigState.enabled,
+    min_confidence: webhookConfigState.min_confidence,
+    device_ids: webhookConfigState.device_ids || [],
+    channels: webhookConfigState.channels.map((c) => ({
+      type: c.type || "generic",
+      url: c.url || "",
+      secret: c.secret || "",
+      enabled: c.enabled !== false,
+      headers: c.headers || {},
+      timeout: Number(c.timeout) || 10,
+    })),
+  };
+}
+
+async function saveWebhookConfig() {
+  const payload = collectWebhookPayload();
+  for (const ch of payload.channels) {
+    if (ch.type === "generic" && ch.headers && typeof ch.headers !== "object") {
+      throw new Error("通用通道 Headers 必须是合法 JSON 对象");
+    }
+  }
+  await api("/api/platform/webhooks/config", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  fillWebhookForm(payload);
+  toast("Webhook 配置已保存");
+}
+
+async function testWebhookChannel(idx) {
+  syncWebhookChannelFromDom(idx);
+  const ch = webhookConfigState.channels[idx];
+  if (!ch?.url) return toast("请先填写 Webhook URL", true);
+  try {
+    await api("/api/platform/webhooks/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ channel: ch }),
+    });
+    toast(`通道 ${idx + 1} 测试消息已发送`);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function initWebhookConfigPanel() {
+  document.getElementById("btnAddWebhookChannel")?.addEventListener("click", () => {
+    webhookConfigState.channels.push(defaultWebhookChannel());
+    renderWebhookChannels();
+    updateWebhookStatusTag();
+  });
+  document.getElementById("btnSaveWebhook")?.addEventListener("click", async () => {
+    try {
+      await saveWebhookConfig();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+  document.getElementById("whEnabled")?.addEventListener("change", () => {
+    syncWebhookGlobalFromDom();
+    updateWebhookStatusTag();
+  });
+  document.getElementById("whMinConfidence")?.addEventListener("input", syncWebhookGlobalFromDom);
 }

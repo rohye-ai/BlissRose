@@ -97,6 +97,15 @@ def _migrate_platform_schema() -> None:
         ("training_jobs", "created_by", "VARCHAR(64) DEFAULT ''"),
         ("training_jobs", "updated_by", "VARCHAR(64) DEFAULT ''"),
         ("training_jobs", "updated_at", "DATETIME"),
+        ("models", "stage", "VARCHAR(16) DEFAULT 'staging'"),
+        ("models", "metrics_json", "TEXT DEFAULT '{}'"),
+        ("training_jobs", "metrics_json", "TEXT DEFAULT '{}'"),
+        ("datasets", "format", "VARCHAR(16) DEFAULT 'yolo'"),
+        ("datasets", "review_status", "VARCHAR(16) DEFAULT 'draft'"),
+        ("datasets", "total_count", "INTEGER DEFAULT 0"),
+        ("datasets", "labeled_count", "INTEGER DEFAULT 0"),
+        ("datasets", "unlabeled_count", "INTEGER DEFAULT 0"),
+        ("datasets", "approved_count", "INTEGER DEFAULT 0"),
     ]
     with engine.connect() as conn:
         for table, column, col_type in migrations:
@@ -121,6 +130,9 @@ def _migrate_platform_schema() -> None:
 def init_database(db: Session) -> None:
     Base.metadata.create_all(bind=engine)
     _migrate_platform_schema()
+    from .instance_service import migrate_instances_from_json
+
+    migrate_instances_from_json(db)
     (ROOT_DIR / "data").mkdir(parents=True, exist_ok=True)
 
     menu_by_key: dict[str, Menu] = {}
