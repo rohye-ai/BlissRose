@@ -164,6 +164,10 @@ class ModelInstance:
         image: Image.Image,
         confidence: float | None = None,
         annotate: bool = True,
+        *,
+        source: str = "",
+        source_type: str = "",
+        device_name: str = "",
     ) -> InferenceResult:
         if not self.is_ready():
             raise RuntimeError(f"实例 {self.config.name} 未就绪")
@@ -195,15 +199,37 @@ class ModelInstance:
             annotated = self.annotate(image, detections, items)
             image_b64 = _pil_to_base64(annotated)
 
-        return InferenceResult(
+        result = InferenceResult(
             detections=items,
             count=len(items),
             inference_ms=elapsed_ms,
             image_base64=image_b64,
             instance_id=self.config.id,
+            source=source,
         )
+        from .inference_log import log_inference
 
-    def predict_numpy(self, frame_bgr: np.ndarray, **kwargs: Any) -> tuple[InferenceResult, np.ndarray]:
+        log_inference(
+            instance_id=cfg.id,
+            instance_name=cfg.name,
+            source=source,
+            source_type=source_type,
+            device_name=device_name,
+            inference_ms=elapsed_ms,
+            count=len(items),
+            detections=items,
+        )
+        return result
+
+    def predict_numpy(
+        self,
+        frame_bgr: np.ndarray,
+        *,
+        source: str = "",
+        source_type: str = "",
+        device_name: str = "",
+        **kwargs: Any,
+    ) -> tuple[InferenceResult, np.ndarray]:
         rgb = frame_bgr[:, :, ::-1]
         image = Image.fromarray(rgb)
         threshold = kwargs.get("confidence")
@@ -231,6 +257,19 @@ class ModelInstance:
             count=len(items),
             inference_ms=elapsed_ms,
             instance_id=self.config.id,
+            source=source,
+        )
+        from .inference_log import log_inference
+
+        log_inference(
+            instance_id=self.config.id,
+            instance_name=self.config.name,
+            source=source,
+            source_type=source_type or "video",
+            device_name=device_name,
+            inference_ms=elapsed_ms,
+            count=len(items),
+            detections=items,
         )
         return result, annotated_bgr
 
@@ -383,8 +422,14 @@ class InstanceManager:
         except KeyError:
             return None
 
-    def predict_pil(self, image: Image.Image, confidence: float | None = None, annotate: bool = True) -> InferenceResult:
-        return self.get_default().predict_pil(image, confidence, annotate)
+    def predict_pil(
+        self,
+        image: Image.Image,
+        confidence: float | None = None,
+        annotate: bool = True,
+        **kwargs: Any,
+    ) -> InferenceResult:
+        return self.get_default().predict_pil(image, confidence, annotate, **kwargs)
 
     def predict_numpy(self, frame_bgr: np.ndarray, **kwargs: Any) -> tuple[InferenceResult, np.ndarray]:
         return self.get_default().predict_numpy(frame_bgr, **kwargs)

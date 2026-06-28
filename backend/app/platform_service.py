@@ -90,8 +90,9 @@ def _find_all_images(root: Path) -> list[Path]:
 
 def _write_data_yaml(dest_dir: Path, class_names: list[str]) -> Path:
     names = class_names or ["object"]
+    root = dest_dir.resolve()
     data = {
-        "path": ".",
+        "path": str(root).replace("\\", "/"),
         "train": "train/images",
         "val": "valid/images",
         "test": "test/images",
@@ -1033,7 +1034,13 @@ def pre_annotate_image(
         raise HTTPException(status_code=400, detail=f"推理实例 {instance_id} 未就绪，请先启动")
 
     image = Image.open(target).convert("RGB")
-    result = model_manager.get(instance_id).predict_pil(image, confidence, False)
+    result = model_manager.get(instance_id).predict_pil(
+        image,
+        confidence,
+        False,
+        source=image_path,
+        source_type="dataset",
+    )
     class_names = _json_loads(rec.class_names, [])
     w, h = image.size
     annotations: list[dict[str, Any]] = []

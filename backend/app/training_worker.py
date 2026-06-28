@@ -16,6 +16,7 @@ from .db_models import DatasetRecord, ModelRecord, TrainingJobRecord
 from .model_manager import infer_model_size
 from .schemas import TrainState
 from .training_checkpoints import find_resume_checkpoint, rel_checkpoint_path
+from .yolo_dataset import prepare_yolo_data_yaml
 
 
 class TrainingWorker:
@@ -470,6 +471,9 @@ class TrainingWorker:
         yaml_path = ROOT_DIR / data_yaml if data_yaml else dataset / "data.yaml"
         if not yaml_path.is_file():
             yaml_path = dataset / "data.yaml"
+        if not yaml_path.is_file():
+            raise FileNotFoundError(f"data.yaml 不存在: {yaml_path}")
+        prepared_yaml = prepare_yolo_data_yaml(yaml_path)
         ckpt = ROOT_DIR / checkpoint if checkpoint and not Path(checkpoint).is_absolute() else Path(checkpoint or "")
         if not ckpt.exists():
             raise FileNotFoundError(f"YOLO 权重不存在: {checkpoint}")
@@ -479,7 +483,7 @@ class TrainingWorker:
             "--weights",
             str(ckpt),
             "--data-yaml",
-            str(yaml_path),
+            str(prepared_yaml),
             "--output-dir",
             str(output),
             "--epochs",

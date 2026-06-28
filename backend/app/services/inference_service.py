@@ -17,12 +17,15 @@ async def _infer_one(
     confidence: float | None,
     annotate: bool,
     source: str,
+    source_type: str = "image",
 ) -> InferenceResult:
     result = await asyncio.to_thread(
         model_manager.get(instance_id).predict_pil,
         image,
         confidence,
         annotate,
+        source=source,
+        source_type=source_type,
     )
     result.source = source
     return result
@@ -48,7 +51,7 @@ async def batch_infer_images(
             errors.append({"source": filename, "error": f"无效图片: {exc}"})
             continue
         try:
-            result = await _infer_one(image, instance_id, confidence, annotate, filename)
+            result = await _infer_one(image, instance_id, confidence, annotate, filename, "upload")
             total_ms += result.inference_ms
             results.append(result.model_dump())
         except Exception as exc:
@@ -88,7 +91,7 @@ async def batch_infer_urls(
                 errors.append({"source": url, "error": f"无法下载: {exc}"})
                 continue
             try:
-                result = await _infer_one(image, instance_id, confidence, annotate, url)
+                result = await _infer_one(image, instance_id, confidence, annotate, url, "url")
                 total_ms += result.inference_ms
                 results.append(result.model_dump())
             except Exception as exc:

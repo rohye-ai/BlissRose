@@ -60,7 +60,10 @@ def _evaluate_yolo(
 
     metrics: dict[str, Any] = {"model_type": "yolo", "split": split}
     if data_yaml and Path(data_yaml).exists():
-        result = yolo.val(data=data_yaml, split=split, verbose=False)
+        from ..yolo_dataset import prepare_yolo_data_yaml
+
+        prepared = prepare_yolo_data_yaml(Path(data_yaml))
+        result = yolo.val(data=str(prepared), split=split, verbose=False)
         if hasattr(result, "box"):
             box = result.box
             metrics.update(

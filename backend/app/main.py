@@ -519,15 +519,12 @@ async def infer_image(
 
 
     result = await asyncio.to_thread(
-
         model_manager.get(target).predict_pil,
-
         image,
-
         confidence,
-
         True,
-
+        source=file.filename or "upload",
+        source_type="upload",
     )
 
     result.source = file.filename or "upload"
@@ -567,15 +564,12 @@ async def infer_url(body: InferUrlRequest):
 
 
     result = await asyncio.to_thread(
-
         model_manager.get(target).predict_pil,
-
         image,
-
         body.confidence,
-
         True,
-
+        source=body.url,
+        source_type="url",
     )
 
     result.source = body.url

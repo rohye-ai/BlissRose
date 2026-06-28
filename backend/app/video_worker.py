@@ -114,7 +114,11 @@ class VideoStreamWorker:
                 skip_counter = 0
 
             try:
-                result, annotated = model_manager.get(cfg.instance_id).predict_numpy(frame)
+                result, annotated = model_manager.get(cfg.instance_id).predict_numpy(
+                    frame,
+                    source=str(cfg.source),
+                    source_type="video",
+                )
                 ok_enc, jpeg = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
                 if ok_enc:
                     with self._lock:

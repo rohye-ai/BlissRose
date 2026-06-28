@@ -158,11 +158,22 @@ class InstanceAnalysisTask:
             import numpy as np
 
             frame = np.array(image)[:, :, ::-1]
-            result, _ = model_manager.get(self.instance_id).predict_numpy(frame)
+            result, _ = model_manager.get(self.instance_id).predict_numpy(
+                frame,
+                source=device.source,
+                source_type="video",
+                device_name=device.name,
+            )
             self._maybe_alert(device, result, image, rois)
         else:
             image = self._fetch_image(device)
-            result = model_manager.get(self.instance_id).predict_pil(image, annotate=True)
+            result = model_manager.get(self.instance_id).predict_pil(
+                image,
+                annotate=True,
+                source=device.source,
+                source_type="image",
+                device_name=device.name,
+            )
             self._maybe_alert(device, result, image, rois)
 
     def _run_loop(self) -> None:
